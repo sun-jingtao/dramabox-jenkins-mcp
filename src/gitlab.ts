@@ -98,6 +98,9 @@ export async function getMergeStatus(project: ProjectRef, branch: string): Promi
     };
   }
 
+  // 有意的口径差异：分支存在时 MR 会被 compare 领先否决，这里却凭 MR 放行——
+  // 因为防覆盖保护的是「他人活跃分支上未合并的工作」，删除分支本身就是作者
+  // 已了结该分支的强信号；即使 MR 后还推过未合并提交，也是作者主动放弃的。
   const mrs = await findMergedMr();
   if (mrs && mrs.length > 0) {
     return { state: "merged", detail: `分支已删除，存在已合并 MR !${mrs[0].iid}` };
