@@ -1,24 +1,13 @@
-import { readFileSync } from "node:fs";
-import { dirname, join } from "node:path";
-import { fileURLToPath } from "node:url";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
 
-// ─── 配置：Token 常驻本地进程，不进对话 ───────────────────────────────────────
-
-const root = join(dirname(fileURLToPath(import.meta.url)), "..");
-try {
-  for (const line of readFileSync(join(root, ".env"), "utf8").split("\n")) {
-    const m = line.match(/^\s*(\w+)\s*=\s*(.*?)\s*$/);
-    if (m && !(m[1] in process.env)) process.env[m[1]] = m[2];
-  }
-} catch {
-  // 无 .env 时走 process.env（mcp.json env 注入）
-}
+// ─── 配置：仅从 MCP 宿主注入的 process.env 读取（mcp.json → env），不读 .env 文件 ─
 
 function requireEnv(key: string): string {
   const v = process.env[key];
-  if (!v) throw new Error(`缺少环境变量 ${key}，请在项目根目录 .env 中配置`);
+  if (!v) {
+    throw new Error(`缺少环境变量 ${key}，请在 Cursor mcp.json 的 env 中配置（勿写入对话）`);
+  }
   return v.replace(/\/+$/, "");
 }
 
