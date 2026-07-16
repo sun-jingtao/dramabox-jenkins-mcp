@@ -87,7 +87,9 @@ export async function getMergeStatus(project: ProjectRef, branch: string): Promi
     // （MR 合并后分支可能又有新提交，自动放行有覆盖风险）
     const mrs = await findMergedMr();
     const squashHint =
-      mrs && mrs.length > 0 ? `；存在已合并 MR !${mrs[0].iid}（可能为 squash 合并），如确认无后续改动可 force` : "";
+      mrs && mrs.length > 0
+        ? `；存在已合并 MR !${mrs[0].iid} 但 compare 仍领先——可能是 squash 合并，也可能合并后又有新提交，确认无未合并改动后可 force`
+        : "";
     return {
       state: "not_merged",
       detail: `领先 ${target} ${cmp.commits.length} 个提交，覆盖部署前需确认${squashHint}`,

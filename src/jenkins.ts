@@ -3,6 +3,10 @@
 import { requireEnv } from "./env.js";
 import { normalizeRepo, type JobInfo } from "./match.js";
 
+// ponytail: 进程内缓存全量 Job；Cursor 重启即刷新。不够新鲜时再加 TTL。
+// updateJobBranch 写成功后会就地更新对应项，保证同进程内读写一致。
+let jobCache: JobInfo[] | null = null;
+
 function authHeader(): string {
   return `Basic ${Buffer.from(`${requireEnv("JENKINS_USER")}:${requireEnv("JENKINS_TOKEN")}`).toString("base64")}`;
 }
@@ -110,8 +114,10 @@ export interface JobStatus extends JobInfo {
 /** 单个 Job 的当前配置 + 最近一次构建（Job 不存在时抛错） */
 export async function getJobStatus(name: string): Promise<JobStatus> {
   const xml = await jenkinsGet(`/job/${encodeURIComponent(name)}/config.xml`);
-  const desc = xml.match(/<description>([\s\S]*?)<\/description>/)?.[1] ?? "";
-  const deployUrls = [...new Set(desc.match(/https?:\/\/[^\s<>"'&]+/g) ?? [])];
+  // description 在 config.xml 里是 XML 转义的，先还原实体再抽 URL，否则 ?a=1&b=2 会在 &amp; 处截断
+  const desc = (xml.match(/<description>([\s\S]*?)<\/description>/)?.[1] ?? "")
+    .replace(/&amp;/g, "&").replace(/&lt;/g, "<").replace(/&gt;/g, ">").replace(/&quot;/g, '"').replace(/&#39;/g, "'");
+  const deployUrls = [...new Set(desc.match(/https?:\/\/[^\s<>"']+/g) ?? [])];
   let lastBuild: LastBuild | null = null;
   try {
     const b = JSON.parse(
@@ -130,9 +136,6 @@ export async function getJobStatus(name: string): Promise<JobStatus> {
   }
   return { name, ...parseJobConfig(xml), lastBuild, deployUrls };
 }
-
-// ponytail: 进程内缓存全量 Job；Cursor 重启即刷新。不够新鲜时再加 TTL。
-let jobCache: JobInfo[] | null = null;
 
 /**
  * 接口：
