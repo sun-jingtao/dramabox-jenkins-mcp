@@ -7,7 +7,7 @@ import { z } from "zod";
 import { requireEnv } from "./env.js";
 import { getJobStatus, listJenkinsJobs, triggerBuild, updateJobBranch } from "./jenkins.js";
 import { branchExists, getMergeStatus, getProjectByPath, searchGitlabProjects, type MergeStatus } from "./gitlab.js";
-import { appendDeployLog } from "./history.js";
+import { appendDeployLog, readDeployLog } from "./history.js";
 import { auditWarnings, matchJobs, type GitlabProject } from "./match.js";
 
 // ─── 注册：全部 MCP 工具的目录 ───────────────────────────────────────────────
@@ -63,6 +63,40 @@ export function registerTools(server: McpServer): void {
     },
     async ({ job, branch, force }) => ({
       content: [{ type: "text" as const, text: await runDeploy(job, branch, force) }],
+    })
+  );
+
+  server.registerTool(
+    "list_history",
+    {
+      title: "查看部署记录",
+      description: "查看本工具执行过的分支切换与构建记录（最新在前）。",
+      inputSchema: {
+        job: z.string().optional().describe("Jenkins Job 名；不传则返回全部 Job 的记录"),
+      },
+      annotations: { readOnlyHint: true },
+    },
+    async ({ job }) => ({
+      content: [{ type: "text" as const, text: runListHistory(job) }],
+    })
+  );
+
+  server.registerTool(
+    "rollback",
+    {
+      title: "回滚到上一个分支",
+      description:
+        "把 Job 切回部署记录中最近一次分支变更前的分支并构建。内部走 deploy 同一套防覆盖检查，被拦截时同样需向用户确认后带 force=true。",
+      inputSchema: {
+        job: z.string().describe("Jenkins Job 精确名称"),
+        force: z
+          .boolean()
+          .optional()
+          .describe("覆盖确认：仅在用户明确同意覆盖未合并/无法确认的分支后才传 true"),
+      },
+    },
+    async ({ job, force }) => ({
+      content: [{ type: "text" as const, text: await runRollback(job, force) }],
     })
   );
 }
@@ -195,4 +229,37 @@ export async function runDeploy(job: string, branch: string, force = false): Pro
       ? `构建: #${build}  ${base}/job/${encodeURIComponent(job)}/${build}/`
       : `构建: 已入队（构建号未及取到）  ${base}/job/${encodeURIComponent(job)}/`,
   ].join("\n");
+}
+
+// ─── list_history ────────────────────────────────────────────────────────────
+
+/** 部署记录，最新在前，最多 20 条 */
+export function runListHistory(job?: string): string {
+  const recs = readDeployLog(job).slice(0, 20);
+  if (recs.length === 0) {
+    return `暂无部署记录${job ? `（job=${job}）` : ""}。只有经本工具 deploy/rollback 的操作才会入账。`;
+  }
+  return recs
+    .map((r) => {
+      const t = new Date(r.time).toLocaleString("zh-CN");
+      const change = r.from === r.to ? `${r.to}（重新构建）` : `${r.from} → ${r.to}`;
+      return `- [${t}] ${r.job}  ${change}${r.build ? `  #${r.build}` : ""}`;
+    })
+    .join("\n");
+}
+
+// ─── rollback ────────────────────────────────────────────────────────────────
+
+/** 从账本找最近一次分支变更，切回变更前的分支；执行与防覆盖检查复用 runDeploy */
+export async function runRollback(job: string, force = false): Promise<string> {
+  const recs = readDeployLog(job);
+  if (recs.length === 0) {
+    return `无法回滚：${job} 没有部署记录。只有经本工具 deploy 的分支切换才可回滚。`;
+  }
+  const lastChange = recs.find((r) => r.from !== r.to);
+  if (!lastChange) {
+    return `无法回滚：${job} 的记录里只有重新构建，没有分支变更。`;
+  }
+  const result = await runDeploy(job, lastChange.from, force);
+  return `回滚目标: ${lastChange.to} 切回 ${lastChange.from}（依据 ${new Date(lastChange.time).toLocaleString("zh-CN")} 的记录）\n${result}`;
 }

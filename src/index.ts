@@ -3,7 +3,7 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { assertEnv } from "./env.js";
 import { runSelfCheck } from "./self-check.js";
-import { registerTools, runDeploy, runFindJob, runGetStatus } from "./tools.js";
+import { registerTools, runDeploy, runFindJob, runGetStatus, runListHistory, runRollback } from "./tools.js";
 
 const server = new McpServer({ name: "dramabox-jenkins-mcp", version: "0.1.0" });
 registerTools(server);
@@ -22,6 +22,13 @@ if (process.argv.includes("--self-check")) {
   // 本地调试：node dist/index.js --deploy <job> <branch> [--force]
   assertEnv();
   console.log(await runDeploy(process.argv[3] ?? "", process.argv[4] ?? "", process.argv.includes("--force")));
+} else if (process.argv[2] === "--history") {
+  // 本地调试：node dist/index.js --history [job]
+  console.log(runListHistory(process.argv[3]));
+} else if (process.argv[2] === "--rollback") {
+  // 本地调试：node dist/index.js --rollback <job> [--force]
+  assertEnv();
+  console.log(await runRollback(process.argv[3] ?? "", process.argv.includes("--force")));
 } else {
   assertEnv(); // fail-fast：配置缺失在启动时暴露，而非首次工具调用时
   await server.connect(new StdioServerTransport());
