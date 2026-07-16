@@ -42,6 +42,14 @@ export async function getProjectByPath(path: string): Promise<ProjectRef | null>
   return p ? { id: p.id, defaultBranch: p.default_branch } : null;
 }
 
+/** 分支当前是否存在于仓库（deploy 目标分支校验用） */
+export async function branchExists(project: ProjectRef, branch: string): Promise<boolean> {
+  const b = await gitlabGet<{ name: string }>(
+    `/projects/${project.id}/repository/branches/${encodeURIComponent(branch)}`
+  );
+  return b !== null;
+}
+
 export interface MergeStatus {
   state: "merged" | "not_merged" | "unknown";
   detail: string;
