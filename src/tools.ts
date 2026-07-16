@@ -152,6 +152,9 @@ export async function runGetStatus(job: string): Promise<string> {
       ? `最近构建: #${status.lastBuild.number} ${status.lastBuild.result} (${new Date(status.lastBuild.timestamp).toLocaleString("zh-CN")})\n  ${status.lastBuild.url}`
       : "最近构建: 从未构建"
   );
+  if (status.deployUrls.length > 0) {
+    lines.push(`部署页线索（来自 Job 描述）: ${status.deployUrls.join("  ")}`);
+  }
 
   if (!status.repo) {
     lines.push("仓库: 未解析出 Git 仓库（无静态 SCM），无法判断合并状态");

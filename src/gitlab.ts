@@ -67,6 +67,11 @@ export async function getMergeStatus(project: ProjectRef, branch: string): Promi
     return { state: "merged", detail: `就是主干分支 ${target}` };
   }
 
+  const findMergedMr = () =>
+    gitlabGet<{ iid: number }[]>(
+      `/projects/${project.id}/merge_requests?source_branch=${encodeURIComponent(branch)}&target_branch=${encodeURIComponent(target)}&state=merged&per_page=1`
+    );
+
   const exists = await gitlabGet<{ name: string }>(
     `/projects/${project.id}/repository/branches/${encodeURIComponent(branch)}`
   );
@@ -75,14 +80,21 @@ export async function getMergeStatus(project: ProjectRef, branch: string): Promi
       `/projects/${project.id}/repository/compare?from=${encodeURIComponent(target)}&to=${encodeURIComponent(branch)}`
     );
     if (!cmp) return { state: "unknown", detail: "compare 接口查询失败" };
-    return cmp.commits.length === 0
-      ? { state: "merged", detail: `分支提交已全部进入 ${target}` }
-      : { state: "not_merged", detail: `领先 ${target} ${cmp.commits.length} 个提交，覆盖部署前需确认` };
+    if (cmp.commits.length === 0) {
+      return { state: "merged", detail: `分支提交已全部进入 ${target}` };
+    }
+    // squash 合并后 tip 不在主干，compare 恒有领先；补查 merged MR 供人判断，但不放松拦截
+    // （MR 合并后分支可能又有新提交，自动放行有覆盖风险）
+    const mrs = await findMergedMr();
+    const squashHint =
+      mrs && mrs.length > 0 ? `；存在已合并 MR !${mrs[0].iid}（可能为 squash 合并），如确认无后续改动可 force` : "";
+    return {
+      state: "not_merged",
+      detail: `领先 ${target} ${cmp.commits.length} 个提交，覆盖部署前需确认${squashHint}`,
+    };
   }
 
-  const mrs = await gitlabGet<{ iid: number }[]>(
-    `/projects/${project.id}/merge_requests?source_branch=${encodeURIComponent(branch)}&target_branch=${encodeURIComponent(target)}&state=merged&per_page=1`
-  );
+  const mrs = await findMergedMr();
   if (mrs && mrs.length > 0) {
     return { state: "merged", detail: `分支已删除，存在已合并 MR !${mrs[0].iid}` };
   }

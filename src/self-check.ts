@@ -1,7 +1,7 @@
-// ─── 自检：守护 normalizeRepo 归一化规则（每条断言对应一个真实踩过的坑）─────
+// ─── 自检：守护 normalizeRepo 归一化与 matchJobs 匹配规则（每条断言对应一个真实踩过的坑）─
 // 纯函数、无需 env；跑法：npm run self-check
 
-import { normalizeRepo } from "./match.js";
+import { matchJobs, normalizeRepo, type JobInfo } from "./match.js";
 
 export function runSelfCheck(): void {
   const eq = (a: string | null, b: string | null) => {
@@ -23,6 +23,30 @@ export function runSelfCheck(): void {
   // 子串陷阱：other ≠ other_webpay
   if (normalizeRepo("git@192.168.0.31:fe/dramabox_other_webpay.git") === "gitlab31:fe/dramabox_other") {
     throw new Error("self-check 失败: 子串陷阱");
+  }
+
+  // ── matchJobs：精确过滤与不回退 ──
+  const jobs: JobInfo[] = [
+    { name: "TEST-hot-dramabox-other", remote: "git@192.168.0.31:fe/dramabox_other.git", repo: "gitlab31:fe/dramabox_other", branch: "master" },
+    { name: "TEST-hot-fe-dramabox-webpay", remote: "git@192.168.0.31:fe/dramabox_other_webpay.git", repo: "gitlab31:fe/dramabox_other_webpay", branch: "test" },
+    { name: "job-no-scm", remote: "", repo: null, branch: "" },
+  ];
+  const projects = [
+    { path: "fe/dramabox_other", key: "gitlab31:fe/dramabox_other" },
+    { path: "fe/dramabox_other_webpay", key: "gitlab31:fe/dramabox_other_webpay" },
+  ];
+  // GitLab search 模糊召回两个项目时，关键词精确命中 → 只匹配精确项，webpay 不得混入
+  const hits = matchJobs(jobs, projects, "dramabox_other");
+  if (hits.length !== 1 || hits[0].name !== "TEST-hot-dramabox-other") {
+    throw new Error(`self-check 失败: matchJobs 精确过滤，实际 ${hits.map((j) => j.name).join(",")}`);
+  }
+  // GitLab 无命中 → 空结果，绝不回退为子串匹配
+  if (matchJobs(jobs, [], "dramabox").length !== 0) {
+    throw new Error("self-check 失败: matchJobs 不得模糊回退");
+  }
+  // env 过滤按 Job 名
+  if (matchJobs(jobs, projects, "dramabox_other_webpay", "hot").length !== 1) {
+    throw new Error("self-check 失败: matchJobs env 过滤");
   }
   console.log("self-check ok");
 }

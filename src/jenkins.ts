@@ -56,6 +56,9 @@ export async function updateJobBranch(name: string, newBranch: string): Promise<
   const oldBranch = m[2];
   const updated = xml.replace(m[0], `${m[1]}${escapeXml(newBranch)}${m[3]}`);
   await jenkinsPost(`/job/${encodeURIComponent(name)}/config.xml`, updated, "application/xml");
+  // 同步 jobCache，否则同进程内 find_job 会继续报旧分支
+  const cached = jobCache?.find((j) => j.name === name);
+  if (cached) cached.branch = newBranch;
   return oldBranch;
 }
 
@@ -101,11 +104,14 @@ export interface LastBuild {
 
 export interface JobStatus extends JobInfo {
   lastBuild: LastBuild | null; // null = 从未构建
+  deployUrls: string[]; // Job 描述里的 URL（部署页线索；README 约定拼路径太脆，不做）
 }
 
 /** 单个 Job 的当前配置 + 最近一次构建（Job 不存在时抛错） */
 export async function getJobStatus(name: string): Promise<JobStatus> {
   const xml = await jenkinsGet(`/job/${encodeURIComponent(name)}/config.xml`);
+  const desc = xml.match(/<description>([\s\S]*?)<\/description>/)?.[1] ?? "";
+  const deployUrls = [...new Set(desc.match(/https?:\/\/[^\s<>"'&]+/g) ?? [])];
   let lastBuild: LastBuild | null = null;
   try {
     const b = JSON.parse(
@@ -122,7 +128,7 @@ export async function getJobStatus(name: string): Promise<JobStatus> {
   } catch {
     // lastBuild 404 = 从未构建，不是错误
   }
-  return { name, ...parseJobConfig(xml), lastBuild };
+  return { name, ...parseJobConfig(xml), lastBuild, deployUrls };
 }
 
 // ponytail: 进程内缓存全量 Job；Cursor 重启即刷新。不够新鲜时再加 TTL。
