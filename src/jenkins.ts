@@ -114,9 +114,12 @@ export interface JobStatus extends JobInfo {
 /** 单个 Job 的当前配置 + 最近一次构建（Job 不存在时抛错） */
 export async function getJobStatus(name: string): Promise<JobStatus> {
   const xml = await jenkinsGet(`/job/${encodeURIComponent(name)}/config.xml`);
-  // description 在 config.xml 里是 XML 转义的，先还原实体再抽 URL，否则 ?a=1&b=2 会在 &amp; 处截断
+  // description 在 config.xml 里是 XML 转义的，先还原实体再抽 URL，否则 ?a=1&b=2 会在 &amp; 处截断。
+  // 数字实体（如换行 &#xd;）还原成真实字符后由 \s 自然断开；&amp; 必须最后替换，防双重转义误还原。
   const desc = (xml.match(/<description>([\s\S]*?)<\/description>/)?.[1] ?? "")
-    .replace(/&amp;/g, "&").replace(/&lt;/g, "<").replace(/&gt;/g, ">").replace(/&quot;/g, '"').replace(/&#39;/g, "'");
+    .replace(/&#x([0-9a-f]+);/gi, (_, h) => String.fromCodePoint(parseInt(h, 16)))
+    .replace(/&#(\d+);/g, (_, d) => String.fromCodePoint(Number(d)))
+    .replace(/&lt;/g, "<").replace(/&gt;/g, ">").replace(/&quot;/g, '"').replace(/&amp;/g, "&");
   const deployUrls = [...new Set(desc.match(/https?:\/\/[^\s<>"']+/g) ?? [])];
   let lastBuild: LastBuild | null = null;
   try {
