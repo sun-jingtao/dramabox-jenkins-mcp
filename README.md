@@ -1,6 +1,6 @@
 # dramabox-jenkins-mcp
 
-DramaBox Jenkins HOT/QAT 部署助手（Cursor MCP）。
+DramaBox Jenkins HOT/QAT 部署助手（MCP Server），支持 Claude Code、Claude Desktop、Cursor 等任意 MCP 客户端。
 
 让 Agent 在对话里完成：定位 Job → 读当前分支 →（后续）改分支并 Build，避免每次手动切 Jenkins，也不把 Token 贴进对话。
 
@@ -22,9 +22,17 @@ npm run build
 npm run self-check
 ```
 
-### 2. 在 Cursor MCP 配置里填写凭证
+### 2. 在 MCP 客户端配置里填写凭证
 
-编辑 `~/.cursor/mcp.json`（或项目内 `.cursor/mcp.json`）：
+各客户端配置文件位置：
+
+| 客户端 | 配置位置 |
+| --- | --- |
+| Claude Code | 项目 `.mcp.json`，或 `claude mcp add` 命令 |
+| Claude Desktop | 设置 → 开发者 → `claude_desktop_config.json` |
+| Cursor | `~/.cursor/mcp.json`（或项目内 `.cursor/mcp.json`） |
+
+配置内容通用（标准 `mcpServers` 格式）：
 
 ```json
 {
@@ -54,14 +62,14 @@ npm run self-check
 | `JENKINS_USER` | Jenkins 用户名 |
 | `JENKINS_TOKEN` | Jenkins API Token（用户设置里生成，不是登录密码） |
 
-> 凭证**只**通过 `mcp.json` 的 `env` 注入进程，进程内不读取 `.env` 文件。请勿把 Token 提交到仓库或贴进对话。
+> 凭证**只**通过 MCP 配置的 `env` 注入进程，进程内不读取 `.env` 文件。请勿把 Token 提交到仓库或贴进对话。
 
 团队推广时：每人复制同一段 `mcpServers` 配置，各自换成自己的 Token；后续若发 npm 包，把 `command`/`args` 换成 `npx` 即可，`env` 字段不用改。
 
 ### 3. 启用 MCP
 
-1. 保存 `mcp.json` 后，打开 Cursor → **Settings → MCP**，确认 `dramabox-jenkins` 为已连接（绿点）。
-2. 若刚改过代码，先 `npm run build`，再在 MCP 面板刷新 / 重启该 server。
+1. 保存配置后重启客户端（或刷新 MCP server），确认 `dramabox-jenkins` 已连接：Claude Code 里执行 `/mcp` 查看，Cursor 在 Settings → MCP 看绿点。
+2. 若刚改过代码，先 `npm run build`，再重启该 server。
 3. 新开对话，让 Agent 调用工具（见下方示例）。
 
 ## 使用示例
@@ -74,21 +82,7 @@ npm run self-check
 
 > 帮我定位仓库 dramabox_other 在 Jenkins 上的 QAT 部署 Job，看看当前分支是什么
 
-不经过 Cursor、本地 CLI 调试时，需在 shell 里显式注入同样的环境变量：
-
-```bash
-export GITLAB_URL=...
-export GITLAB_TOKEN=...
-export JENKINS_URL=...
-export JENKINS_USER=...
-export JENKINS_TOKEN=...
-
-node dist/index.js --find dramabox_other
-node dist/index.js --find dramabox_other hot
-node dist/index.js --find dramabox_other qat
-```
-
-成功时会打印候选 Job 名、当前分支、仓库 remote、Job 链接。
+本地 CLI 调试（shell 中需有同样五个环境变量）：`node dist/index.js --find dramabox_other [hot|qat]`，成功时会打印候选 Job 名、当前分支、仓库 remote、Job 链接。
 
 ## 已实现工具
 
@@ -129,8 +123,8 @@ node dist/index.js --find dramabox_other qat
 
 **调用时报「缺少环境变量」**
 
-- 变量写在 `mcp.json` → `env`，不是项目 `.env`（本项目不读 `.env`）
-- 改完 `mcp.json` 后需重启对应 MCP server
+- 变量写在 MCP 配置的 `env` 字段，不是项目 `.env`（本项目不读 `.env`）
+- 改完配置后需重启对应 MCP server
 
 **`--find` 报 GitLab / Jenkins 状态码错误**
 

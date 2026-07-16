@@ -6,7 +6,7 @@ import { z } from "zod";
 function requireEnv(key: string): string {
   const v = process.env[key];
   if (!v) {
-    throw new Error(`缺少环境变量 ${key}，请在 Cursor mcp.json 的 env 中配置（勿写入对话）`);
+    throw new Error(`缺少环境变量 ${key}，请在 MCP 客户端配置的 env 中注入（勿写入对话）`);
   }
   return v.replace(/\/+$/, "");
 }
