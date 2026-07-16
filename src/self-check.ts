@@ -1,6 +1,7 @@
 // ─── 自检：守护 normalizeRepo 归一化与 matchJobs 匹配规则（每条断言对应一个真实踩过的坑）─
 // 纯函数、无需 env；跑法：npm run self-check
 
+import { setBranchInConfigXml, stripBranchPrefix, unescapeXml } from "./jenkins.js";
 import { matchJobs, normalizeRepo, type JobInfo } from "./match.js";
 
 export function runSelfCheck(): void {
@@ -48,5 +49,19 @@ export function runSelfCheck(): void {
   if (matchJobs(jobs, projects, "dramabox_other_webpay", "hot").length !== 1) {
     throw new Error("self-check 失败: matchJobs env 过滤");
   }
+
+  // ── config.xml 写路径：$ 替换陷阱与实体往返（评审实测复现过的 bug）──
+  const cfg = "<hudson.plugins.git.BranchSpec>\n  <name>*/master</name>\n</hudson.plugins.git.BranchSpec>";
+  for (const nb of ["release$$2024", "feat-$&-x", "a&b"]) {
+    const { updated } = setBranchInConfigXml(cfg, nb);
+    const readBack = unescapeXml(/<name>([\s\S]*?)<\/name>/.exec(updated)![1]);
+    eq(readBack, nb); // 写入什么读回什么，$ 模式与 XML 实体都不得篡改
+  }
+  // oldBranch 剥前缀 + 反转义
+  eq(setBranchInConfigXml(cfg, "x").oldBranch, "master");
+  eq(stripBranchPrefix("refs/heads/dev"), "dev");
+  eq(stripBranchPrefix("origin/dev"), "dev");
+  eq(stripBranchPrefix("dev"), "dev");
+  eq(unescapeXml("a&amp;b &#xd; &apos;"), "a&b \r '");
   console.log("self-check ok");
 }

@@ -18,6 +18,8 @@ export interface JobInfo {
   remote: string; // 原始 <url>；空串 = 无静态 SCM 或读取失败（进 audit 清单）
   repo: string | null; // 归一化匹配键 `host别名:group/repo`
   branch: string;
+  multiScm?: boolean; // 多个 UserRemoteConfig/BranchSpec：deploy 只改第一个，audit 提示
+  folder?: boolean; // Jenkins folder：其内子 Job 当前不可见，audit 提示
 }
 
 export interface GitlabProject {
@@ -91,12 +93,24 @@ export function matchJobs(
 
 /** 非空即漂移信号；unknownHost 需补 HOST_ALIAS 一行配置后重启生效 */
 export function auditWarnings(jobs: JobInfo[]): string {
-  const noScm = jobs.filter((j) => !j.remote).map((j) => j.name);
+  const folders = jobs.filter((j) => j.folder).map((j) => j.name);
+  const noScm = jobs.filter((j) => !j.remote && !j.folder).map((j) => j.name);
   const unknownHost = jobs
     .filter((j) => j.remote && !isKnownHost(j.remote))
     .map((j) => `${j.name} → ${j.remote}`);
+  const multiScm = jobs.filter((j) => j.multiScm).map((j) => j.name);
 
   const parts: string[] = [];
+  if (folders.length > 0) {
+    parts.push(
+      `⚠️ ${folders.length} 个 folder 类型条目（其内子 Job 当前不可见，无法参与匹配）：${folders.join("、")}`
+    );
+  }
+  if (multiScm.length > 0) {
+    parts.push(
+      `⚠️ ${multiScm.length} 个 Job 配置了多个仓库或多个分支 Spec（本工具只读/只改第一个）：${multiScm.join("、")}`
+    );
+  }
   if (unknownHost.length > 0) {
     parts.push(
       `⚠️ ${unknownHost.length} 个 Job 的仓库 host 不在 HOST_ALIAS 别名表内（形态漂移，无法参与匹配，请补配置）：\n${unknownHost.map((s) => `  - ${s}`).join("\n")}`

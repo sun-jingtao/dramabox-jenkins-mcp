@@ -3,10 +3,11 @@
 import { requireEnv } from "./env.js";
 import { normalizeRepo, type GitlabProject } from "./match.js";
 
-/** GET /api/v4{path}，PRIVATE-TOKEN 鉴权；404 返回 null，其余非 2xx 抛错 */
+/** GET /api/v4{path}，PRIVATE-TOKEN 鉴权，带超时；404 返回 null，其余非 2xx 抛错 */
 async function gitlabGet<T>(path: string): Promise<T | null> {
   const res = await fetch(`${requireEnv("GITLAB_URL")}/api/v4${path}`, {
     headers: { "PRIVATE-TOKEN": requireEnv("GITLAB_TOKEN") },
+    signal: AbortSignal.timeout(15_000), // 对端挂起时防止 MCP 工具调用永久阻塞
   });
   if (res.status === 404) return null;
   if (!res.ok) throw new Error(`GitLab ${path} 返回 ${res.status}`);

@@ -114,11 +114,15 @@ export async function runFindJob(repo: string, envFilter?: "hot" | "qat"): Promi
     return `GitLab 查询失败：${(e as Error).message}。为避免误匹配已中止，请检查 GITLAB_URL / GITLAB_TOKEN 后重试。`;
   }
   const hits = matchJobs(jobs, projects, repo, envFilter);
+  // search 单页上限 100：打满意味着召回可能被截断，目标项目或已漏掉
+  const truncateWarn =
+    projects.length >= 100 ? "\n\n⚠️ GitLab 搜索命中已达单页上限 100，召回可能被截断；若目标缺席请用更精确的仓库名重试。" : "";
 
   if (hits.length === 0) {
     const gitlabHint = projects.map((p) => p.path).join("、") || "无";
     return (
       `未找到匹配 Job（repo=${repo}${envFilter ? `, env=${envFilter}` : ""}）。GitLab 命中项目：${gitlabHint}` +
+      truncateWarn +
       auditWarnings(jobs)
     );
   }
@@ -131,7 +135,7 @@ export async function runFindJob(repo: string, envFilter?: "hot" | "qat"): Promi
         `- ${j.name}\n  当前分支: ${j.branch}\n  仓库: ${j.remote}\n  Job 链接: ${base}/job/${encodeURIComponent(j.name)}/`
     ),
   ].join("\n");
-  return list + auditWarnings(jobs);
+  return list + truncateWarn + auditWarnings(jobs);
 }
 
 // ─── get_status ──────────────────────────────────────────────────────────────
@@ -150,7 +154,9 @@ export async function runGetStatus(job: string): Promise<string> {
   lines.push(
     status.lastBuild
       ? `最近构建: #${status.lastBuild.number} ${status.lastBuild.result} (${new Date(status.lastBuild.timestamp).toLocaleString("zh-CN")})\n  ${status.lastBuild.url}`
-      : "最近构建: 从未构建"
+      : status.lastBuildError
+        ? `最近构建: ⚠️ 查询失败（${status.lastBuildError}），非「从未构建」`
+        : "最近构建: 从未构建"
   );
   if (status.deployUrls.length > 0) {
     lines.push(`部署页线索（来自 Job 描述）: ${status.deployUrls.join("  ")}`);
@@ -181,8 +187,13 @@ export async function runGetStatus(job: string): Promise<string> {
 
 // ─── deploy ──────────────────────────────────────────────────────────────────
 
-/** 防覆盖检查 → 改 BranchSpec → 触发构建 → 写操作日志 */
-export async function runDeploy(job: string, branch: string, force = false): Promise<string> {
+/** 防覆盖检查 → 改 BranchSpec → 触发构建 → 写操作日志（op 供 rollback 标记自身记录） */
+export async function runDeploy(
+  job: string,
+  branch: string,
+  force = false,
+  op: "deploy" | "rollback" = "deploy"
+): Promise<string> {
   let status;
   try {
     status = await getJobStatus(job);
@@ -209,10 +220,15 @@ export async function runDeploy(job: string, branch: string, force = false): Pro
   }
 
   // 目标分支存在性校验（查得到项目才校验，防打错字触发必败构建）
+  // 三态：false（404，分支确实不存在）→ 拦；null（网络/5xx 查询失败）→ 放行但显式 WARN，Jenkins 兜底
+  let branchCheckWarn = "";
   if (project && branch !== current) {
-    const exists = await branchExists(project, branch).catch(() => true); // 查询失败不拦（Jenkins 会兜底报错）
-    if (!exists) {
+    const exists = await branchExists(project, branch).catch(() => null);
+    if (exists === false) {
       return `🛑 已中止部署。GitLab 仓库 ${repoPath} 上不存在分支 ${branch}，请检查分支名。`;
+    }
+    if (exists === null) {
+      branchCheckWarn = `\n⚠️ 目标分支存在性查询失败（GitLab 暂不可达），本次未校验分支名；若分支名有误，构建将失败。`;
     }
   }
 
@@ -221,48 +237,66 @@ export async function runDeploy(job: string, branch: string, force = false): Pro
   if (current !== branch) {
     from = await updateJobBranch(job, branch);
   }
-  const build = await triggerBuild(job);
-  appendDeployLog({ time: new Date().toISOString(), job, from, to: branch, build });
+  // 构建触发失败也必须记账：分支此刻已经改了，账本缺这条会让 list_history/rollback 找不到变更
+  let build: number | null = null;
+  let buildError: string | null = null;
+  try {
+    build = await triggerBuild(job);
+  } catch (e) {
+    buildError = (e as Error).message;
+  }
+  appendDeployLog({ time: new Date().toISOString(), job, from, to: branch, build, op });
 
   const base = requireEnv("JENKINS_URL");
+  const jobUrl = `${base}/job/${encodeURIComponent(job)}/`;
+  if (buildError) {
+    return [
+      `⚠️ 分支已改为 ${branch}${from !== branch ? `（原 ${from}，已记账可回滚）` : ""}，但构建触发失败：${buildError}`,
+      `请到 Jenkins 手动构建或重试 deploy：${jobUrl}`,
+    ].join("\n") + branchCheckWarn;
+  }
   return [
     `✅ 已部署 ${job}`,
     `分支: ${from === branch ? `${branch}（未变更，直接重新构建）` : `${from} → ${branch}`}`,
     build
-      ? `构建: #${build}  ${base}/job/${encodeURIComponent(job)}/${build}/`
-      : `构建: 已入队（构建号未及取到）  ${base}/job/${encodeURIComponent(job)}/`,
-  ].join("\n");
+      ? `构建: #${build}  ${jobUrl}${build}/`
+      : `构建: 已入队（构建号未及取到）  ${jobUrl}`,
+  ].join("\n") + branchCheckWarn;
 }
 
 // ─── list_history ────────────────────────────────────────────────────────────
 
 /** 部署记录，最新在前，最多 20 条 */
 export function runListHistory(job?: string): string {
-  const recs = readDeployLog(job).slice(0, 20);
+  const { records, corrupt } = readDeployLog(job);
+  const corruptNote = corrupt > 0 ? `\n⚠️ 发现 ${corrupt} 行损坏日志已跳过。` : "";
+  const recs = records.slice(0, 20);
   if (recs.length === 0) {
-    return `暂无部署记录${job ? `（job=${job}）` : ""}。只有经本工具 deploy/rollback 的操作才会入账。`;
+    return `暂无部署记录${job ? `（job=${job}）` : ""}。只有经本工具 deploy/rollback 的操作才会入账。` + corruptNote;
   }
   return recs
     .map((r) => {
       const t = new Date(r.time).toLocaleString("zh-CN");
       const change = r.from === r.to ? `${r.to}（重新构建）` : `${r.from} → ${r.to}`;
-      return `- [${t}] ${r.job}  ${change}${r.build ? `  #${r.build}` : ""}`;
+      const tag = r.op === "rollback" ? "  [回滚]" : "";
+      return `- [${t}] ${r.job}  ${change}${r.build ? `  #${r.build}` : ""}${tag}`;
     })
-    .join("\n");
+    .join("\n") + corruptNote;
 }
 
 // ─── rollback ────────────────────────────────────────────────────────────────
 
 /** 从账本找最近一次分支变更，切回变更前的分支；执行与防覆盖检查复用 runDeploy */
 export async function runRollback(job: string, force = false): Promise<string> {
-  const recs = readDeployLog(job);
-  if (recs.length === 0) {
+  const { records } = readDeployLog(job);
+  if (records.length === 0) {
     return `无法回滚：${job} 没有部署记录。只有经本工具 deploy 的分支切换才可回滚。`;
   }
-  const lastChange = recs.find((r) => r.from !== r.to);
+  // 跳过 rollback 自身产生的记录，否则连续回滚会在最近两个分支间横跳，够不到更早历史
+  const lastChange = records.find((r) => r.from !== r.to && r.op !== "rollback");
   if (!lastChange) {
-    return `无法回滚：${job} 的记录里只有重新构建，没有分支变更。`;
+    return `无法回滚：${job} 的记录里没有可回退的部署变更（只有重新构建或回滚记录）。`;
   }
-  const result = await runDeploy(job, lastChange.from, force);
+  const result = await runDeploy(job, lastChange.from, force, "rollback");
   return `回滚目标: ${lastChange.to} 切回 ${lastChange.from}（依据 ${new Date(lastChange.time).toLocaleString("zh-CN")} 的记录）\n${result}`;
 }
