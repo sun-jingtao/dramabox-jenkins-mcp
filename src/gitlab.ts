@@ -58,7 +58,8 @@ export interface MergeStatus {
 /**
  * 判断分支是否已进入主干（PRD 第 4 节）：
  * - 是主干本身 → merged
- * - 分支存在 → compare 主干..分支，0 个独有提交 = merged，否则 not_merged
+ * - 分支存在 → compare 主干..分支，0 个独有提交 = merged；否则 not_merged
+ *   （若有已合并 MR，detail 会提示可能为 squash / 合并后又有新提交，但不放松拦截）
  * - 分支已删除 → 只认 merged MR 记录；查不到 = unknown（不能仅凭分支不存在判定已合并）
  */
 export async function getMergeStatus(project: ProjectRef, branch: string): Promise<MergeStatus> {

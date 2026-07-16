@@ -64,7 +64,7 @@ function isKnownHost(url: string): boolean {
  * 用 GitLab 项目集合过滤 Jenkins Job：归一化键全等，无任何模糊回退。
  * - GitLab search 是模糊召回（"dramabox_other" 也会召回 "dramabox_other_webpay"）：
  *   若有项目名与关键词精确相等，则只用精确项，防止子串近邻混入候选。
- * - GitLab 无命中 → 直接空结果（提示见 formatJobList），绝不降级为子串匹配。
+ * - GitLab 无命中 → 直接空结果（由调用方提示），绝不降级为子串匹配。
  * - envFilter：Job 名包含 hot / qat
  */
 export function matchJobs(

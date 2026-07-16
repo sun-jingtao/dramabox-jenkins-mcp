@@ -1,4 +1,4 @@
-// ─── MCP 工具的注册与编排（find_job / 后续 get_status / deploy…）────────────
+// ─── MCP 工具的注册与编排（find_job / get_status / deploy / list_history / rollback）─
 // 排版约定：注册（工具目录）在最上，往下依次是各工具的编排函数、格式化等细节。
 
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
@@ -35,7 +35,7 @@ export function registerTools(server: McpServer): void {
     {
       title: "查看 Job 部署状态",
       description:
-        "查看 Jenkins Job 的当前部署分支、最近构建结果，以及该分支相对主干的合并状态（deploy 防覆盖检查的依据）。",
+        "查看 Jenkins Job 的当前部署分支、最近构建结果、分支相对主干的合并状态，以及 Job 描述里可知的部署页线索（deploy 防覆盖检查的依据）。",
       inputSchema: {
         job: z.string().describe("Jenkins Job 精确名称（可先用 find_job 定位），如 TEST-hot-dramabox-other"),
       },
@@ -136,7 +136,7 @@ export async function runFindJob(repo: string, envFilter?: "hot" | "qat"): Promi
 
 // ─── get_status ──────────────────────────────────────────────────────────────
 
-/** 查看 Job 当前分支、最近构建，及分支相对主干的合并状态（防覆盖判断依据） */
+/** 查看 Job 当前分支、最近构建、合并状态，及 Job 描述里的部署页线索（防覆盖判断依据） */
 export async function runGetStatus(job: string): Promise<string> {
   let status;
   try {
