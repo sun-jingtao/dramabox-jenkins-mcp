@@ -2,7 +2,7 @@
 
 DramaBox Jenkins HOT/QAT 部署助手（MCP Server），支持 Claude Code、Claude Desktop、Cursor 等任意 MCP 客户端。
 
-让 Agent 在对话里完成：定位 Job → 读当前分支 →（后续）改分支并 Build，避免每次手动切 Jenkins，也不把 Token 贴进对话。
+让 Agent 在对话里完成完整部署闭环：定位 Job → 查分支与合并状态 → 防覆盖检查后改分支并构建 → 记录可查、可回滚。全程不把 Token 贴进对话。
 
 关联需求：[【PRD】Jenkins HOT/QAT 部署助手 MCP](https://www.tapd.cn/tapd_fe/59787500/story/detail/1159787500001022834)
 
@@ -62,7 +62,7 @@ npm run self-check
 | `JENKINS_USER` | Jenkins 用户名 |
 | `JENKINS_TOKEN` | Jenkins API Token（用户设置里生成，不是登录密码） |
 
-> 凭证**只**通过 MCP 配置的 `env` 注入进程，进程内不读取 `.env` 文件。请勿把 Token 提交到仓库或贴进对话。
+> 凭证**只**通过 MCP 配置的 `env` 注入进程，进程内不读取 `.env` 文件；缺失任一变量时 server 启动即报错（fail-fast），不会等到调用时才发现。请勿把 Token 提交到仓库或贴进对话。
 
 团队推广时：每人复制同一段 `mcpServers` 配置，各自换成自己的 Token；后续若发 npm 包，把 `command`/`args` 换成 `npx` 即可，`env` 字段不用改。
 
@@ -74,65 +74,78 @@ npm run self-check
 
 ## 使用示例
 
-对话里可以直接说：
+对话里直接说：
 
-> 用 find_job 查一下 dramabox_other 的 HOT Job
+> 帮我把 dramabox_other 的 HOT 环境部署到 sunjt-0716-fix 分支
 
-或：
+Agent 会自动串联：`find_job` 定位 → `deploy` 防覆盖检查后改分支构建。当前分支未合并进主干时会先告警，需要你明确同意后才覆盖。其他常用说法：
 
-> 帮我定位仓库 dramabox_other 在 Jenkins 上的 QAT 部署 Job，看看当前分支是什么
-
-本地 CLI 调试（shell 中需有同样五个环境变量）：`node dist/index.js --find dramabox_other [hot|qat]`，成功时会打印候选 Job 名、当前分支、仓库 remote、Job 链接。
+> dramabox_other 的 QAT 现在部的是什么分支？合并了吗？（→ find_job + get_status）
+>
+> 刚才部错了，帮我回滚 TEST-hot-dramabox-other（→ rollback）
+>
+> 看下今天都部署过什么（→ list_history）
 
 ## 已实现工具
 
-| 工具 | 作用 |
-| --- | --- |
-| `find_job` | 按 GitLab 仓库关键词定位 Jenkins HOT/QAT 候选 Job，返回 Job 名、当前分支、仓库地址和链接 |
-
-**参数**
-
-| 参数 | 必填 | 说明 |
+| 工具 | 作用 | 写操作 |
 | --- | --- | --- |
-| `repo` | 是 | GitLab 仓库名或关键词，如 `dramabox_other` |
-| `env` | 否 | `hot` / `qat`；不传则返回全部候选 |
+| `find_job` | 按 GitLab 仓库定位候选 Job，返回 Job 名、当前分支、仓库地址和链接 | 否 |
+| `get_status` | Job 当前分支、最近构建结果、该分支相对主干的合并状态 | 否 |
+| `deploy` | 防覆盖检查 → 改 BranchSpec → 触发构建 → 写操作日志 | **是** |
+| `list_history` | 查看经本工具执行的分支切换与构建记录（最新在前） | 否 |
+| `rollback` | 切回记录中最近一次分支变更前的分支并构建（同样过防覆盖检查） | **是** |
 
-**处理流程（便于排查）**
+**deploy / rollback 的防覆盖规则**（PRD 第 4 节）：
 
-1. GitLab `GET /api/v4/projects?search=` 搜仓库
-2. Jenkins 扫 Job 列表 + 读各 Job `config.xml`（remote / BranchSpec）
-3. 用 `group/repo` 路径匹配（兼容内网 IP vs 域名）
-4. 可选按 Job 名过滤 hot / qat，拼成可读文本返回
+- 目标 Job 当前分支已合并进主干 → 直接执行
+- 未合并或无法确认（含仓库属于另一 GitLab 实例、token 无权限）→ 中止并告警，需用户明确同意后带 `force=true` 重试
+- 分支已删除时只认已合并 MR 记录，不凭「分支不存在」判定已合并
+- 目标分支在 GitLab 上不存在 → 直接拒绝（防打错字触发必败构建）
 
-## 路线图（PRD 未落地）
+**匹配规则**：Job 与仓库的对应关系取自 Job `config.xml` 里实际 checkout 的仓库地址，归一化（IP↔域名、`.git` 后缀、斜杠、大小写）后与 GitLab 项目路径**全等**比较，与 Job 名称无关，无模糊回退。内网 IP ↔ 域名映射表在 `src/match.ts` 的 `HOST_ALIAS`，换环境需对应修改；表外 host 会在 find_job 返回里以告警形式列出，不会静默漏配。
 
-| 工具 | 作用 |
-| --- | --- |
-| `get_status` | 当前分支、最近构建、相对 master 合并状态、部署页 |
-| `deploy` | 防覆盖检查 → 改 BranchSpec → 触发构建 → 写操作日志 |
-| `list_history` | 查看该 Job 分支切换记录 |
-| `rollback` | 切回日志中上一次分支并构建 |
+**操作日志**：deploy / rollback 每次执行追加一条到 `~/.dramabox-jenkins-mcp/deploy-log.jsonl`（时间、Job、改动前后分支、构建号），list_history 与 rollback 都以它为数据源。
+
+## 本地 CLI 调试
+
+shell 中需 `export` 同样五个环境变量：
+
+```bash
+node dist/index.js --find <repo> [hot|qat]        # 定位 Job
+node dist/index.js --status <job>                 # 查状态与合并情况
+node dist/index.js --deploy <job> <branch> [--force]  # 部署（写操作！）
+node dist/index.js --history [job]                # 查记录
+node dist/index.js --rollback <job> [--force]     # 回滚（写操作！）
+```
 
 ## 常见问题
 
 **MCP 显示红点 / 工具不可用**
 
 - 确认 `args` 里是**绝对路径**，且已执行过 `npm run build`（存在 `dist/index.js`）
-- 确认 `env` 里五个变量都已填写
-- 改完 `tools.ts` 后必须重新 `npm run build`，再重启 MCP
+- 确认 `env` 里五个变量都已填写（缺失时启动日志会列出全部缺失项）
+- 改完 `src/` 后必须重新 `npm run build`，再重启 MCP
 
 **调用时报「缺少环境变量」**
 
 - 变量写在 MCP 配置的 `env` 字段，不是项目 `.env`（本项目不读 `.env`）
 - 改完配置后需重启对应 MCP server
 
-**`--find` 报 GitLab / Jenkins 状态码错误**
+**deploy 提示「已中止部署」**
 
-- 先确认 shell 里已 `export` 五个变量
-- GitLab Token 是否有 `read_api`，URL 是否可从本机访问
-- Jenkins 用户名 + API Token 是否正确（Basic Auth）
+- 这是防覆盖检查在工作：当前分支未合并或无法确认，盲目覆盖可能丢失他人改动
+- 确认不影响他人后，让 Agent 带 `force=true` 重试（CLI 加 `--force`）
+
+**合并状态显示「无法确认」**
+
+- 该 Job 的仓库属于另一 GitLab 实例或当前 token 无权限，工具不猜测，一律按需确认处理
 
 **找到 0 个 Job**
 
 - 关键词是否太短 / 写错；先不传 `env` 看全量候选
-- 该仓库对应 Job 是否非 Git 源码 Job（无 `config.xml` 里的 git remote 会被跳过）
+- 该 Job 是否非 Git 源码 Job（无静态 SCM 会进 find_job 返回末尾的告警清单）
+
+**rollback 提示无法回滚**
+
+- 只有经本工具 deploy 过分支切换的 Job 才可回滚；手动在 Jenkins 页面改的分支不在账本里
