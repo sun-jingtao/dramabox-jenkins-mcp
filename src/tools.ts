@@ -8,7 +8,13 @@ import { requireEnv } from "./env.js";
 import { getJobStatus, listJenkinsJobs, triggerBuild, updateJobBranch } from "./jenkins.js";
 import { branchExists, getMergeStatus, getProjectByPath, searchGitlabProjects, type MergeStatus } from "./gitlab.js";
 import { appendDeployLog, readDeployLog } from "./history.js";
-import { auditWarnings, matchJobs, type GitlabProject } from "./match.js";
+import { auditWarnings, gitlabInstanceAlias, matchJobs, type GitlabProject } from "./match.js";
+
+/** Job 仓库 host 别名是否与当前连接的 GITLAB_URL 同属一个实例。
+ *  不同实例下同名 path 会指向错误项目，防覆盖须按「无法确认」拦截，绝不跨实例查询后放行。 */
+function sameGitlabInstance(repo: string): boolean {
+  return repo.split(":")[0] === gitlabInstanceAlias(requireEnv("GITLAB_URL"));
+}
 
 // ─── 注册：全部 MCP 工具的目录 ───────────────────────────────────────────────
 
@@ -169,6 +175,14 @@ export async function runGetStatus(job: string): Promise<string> {
   const repoPath = status.repo.split(":")[1];
   lines.push(`仓库: ${status.remote}`);
 
+  // 跨实例守卫：Job 仓库与当前 GITLAB_URL 非同一实例时，同名 path 会指向错误项目，不跨实例查询
+  if (!sameGitlabInstance(status.repo)) {
+    lines.push(
+      `合并状态: ⚠️ 无法确认 —— Job 仓库属于另一 GitLab 实例 ${status.repo.split(":")[0]}，当前连接 ${gitlabInstanceAlias(requireEnv("GITLAB_URL"))}，跨实例不查询以免同名 path 误判`
+    );
+    return lines.join("\n");
+  }
+
   // 合并状态：GitLab 查不到项目（另一实例/无权限）→ unknown，绝不猜测
   try {
     const project = await getProjectByPath(repoPath);
@@ -202,7 +216,11 @@ export async function runDeploy(
   }
   const current = status.branch;
   const repoPath = status.repo?.split(":")[1];
-  const project = repoPath ? await getProjectByPath(repoPath).catch(() => null) : null;
+  // 跨实例守卫：Job 仓库与当前 GITLAB_URL 非同一实例时，同名 path 会指向错误项目——
+  // 绝不跨实例查询后放行覆盖，直接按「无法确认」拦截（除非 force）
+  const crossInstance = !!status.repo && !sameGitlabInstance(status.repo);
+  const project =
+    repoPath && !crossInstance ? await getProjectByPath(repoPath).catch(() => null) : null;
 
   // 防覆盖检查（PRD 第 4 节）：仅在换分支时需要；查不到项目一律按「无法确认」处理
   if (current && current !== branch && !force) {
@@ -210,7 +228,12 @@ export async function runDeploy(
       ? await getMergeStatus(project, current).catch(
           (e) => ({ state: "unknown", detail: `GitLab 查询失败：${(e as Error).message}` }) as MergeStatus
         )
-      : { state: "unknown", detail: `GitLab 上查不到 ${repoPath ?? "该仓库"}（另一实例或无权限）` };
+      : {
+          state: "unknown",
+          detail: crossInstance
+            ? `Job 仓库属于另一 GitLab 实例 ${status.repo!.split(":")[0]}，当前连接 ${gitlabInstanceAlias(requireEnv("GITLAB_URL"))}，跨实例不查询以免同名 path 误判`
+            : `GitLab 上查不到 ${repoPath ?? "该仓库"}（另一实例或无权限）`,
+        };
     if (ms.state !== "merged") {
       return [
         `🛑 已中止部署。当前分支 ${current} ${ms.state === "not_merged" ? "尚未合并进主干" : "合并状态无法确认"}：${ms.detail}`,

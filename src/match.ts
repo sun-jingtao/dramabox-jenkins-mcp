@@ -51,7 +51,17 @@ export function normalizeRepo(url: string): string | null {
     .replace(/^\/+/, "")
     .replace(/\.git\/?$/, "")
     .replace(/\/+$/, "");
-  return `${HOST_ALIAS[s.host] ?? s.host}:${path}`;
+  return `${aliasForHost(s.host)}:${path}`;
+}
+
+/** host（IP 或域名）映射到实例别名；表外 host 原样返回（由 audit 兜住，不静默） */
+function aliasForHost(host: string): string {
+  return HOST_ALIAS[host] ?? host;
+}
+
+/** 当前连接的 GitLab 实例别名（GITLAB_URL 的 host → 别名），用于 deploy 前的跨实例守卫 */
+export function gitlabInstanceAlias(gitlabUrl: string): string {
+  return aliasForHost(new URL(gitlabUrl).hostname.toLowerCase());
 }
 
 /** host 是否已被别名表覆盖；未覆盖 = 形态漂移（如换 IP、新实例），进告警清单 */
@@ -84,7 +94,8 @@ export function matchJobs(
 
   let hits = jobs.filter((j) => j.repo !== null && keys.has(j.repo));
   if (envFilter) {
-    hits = hits.filter((j) => j.name.toLowerCase().includes(envFilter));
+    // 按分隔符切词后全等，而非子串包含：否则 hotfix/photo 等含 "hot" 的词会被 env=hot 误命中
+    hits = hits.filter((j) => j.name.toLowerCase().split(/[-_.]/).includes(envFilter));
   }
   return hits;
 }
