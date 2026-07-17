@@ -2,6 +2,7 @@
 // 排版约定：注册（工具目录）在最上，往下依次是各工具的编排函数、格式化等细节。
 
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
+import { randomUUID } from "node:crypto";
 import { z } from "zod";
 
 import { requireEnv } from "./env.js";
@@ -255,20 +256,47 @@ export async function runDeploy(
     }
   }
 
-  // 执行：改分支（同分支跳过）→ 触发构建 → 记账
+  // 执行：改分支（同分支跳过）→ 先记账 → 触发构建并补记构建号
   let from = current;
   if (current !== branch) {
     from = await updateJobBranch(job, branch);
   }
-  // 构建触发失败也必须记账：分支此刻已经改了，账本缺这条会让 list_history/rollback 找不到变更
+  // 分支已经改完，等待 queue 构建号前先持久化；进程即使在轮询期间退出，rollback 仍有依据。
+  const pendingRecord = {
+    id: randomUUID(),
+    time: new Date().toISOString(),
+    job,
+    from,
+    to: branch,
+    build: null,
+    op,
+  } as const;
+  try {
+    appendDeployLog(pendingRecord);
+  } catch (e) {
+    const change = from === branch ? `分支仍为 ${branch}` : `分支已从 ${from} 改为 ${branch}`;
+    return [
+      `🛑 ${change}，但部署账本写入失败：${(e as Error).message}`,
+      "为避免产生无法自动回滚的构建，本次未触发构建。请修复账本权限或磁盘问题后重试。",
+    ].join("\n") + branchCheckWarn;
+  }
+
   let build: number | null = null;
   let buildError: string | null = null;
+  let logUpdateError: string | null = null;
   try {
     build = await triggerBuild(job);
   } catch (e) {
     buildError = (e as Error).message;
   }
-  appendDeployLog({ time: new Date().toISOString(), job, from, to: branch, build, op });
+  if (build !== null) {
+    try {
+      appendDeployLog({ ...pendingRecord, build });
+    } catch (e) {
+      // pending 记录已经存在，回滚依据未丢；只提示构建号未能补记。
+      logUpdateError = (e as Error).message;
+    }
+  }
 
   const base = requireEnv("JENKINS_URL");
   const jobUrl = `${base}/job/${encodeURIComponent(job)}/`;
@@ -278,13 +306,16 @@ export async function runDeploy(
       `请到 Jenkins 手动构建或重试 deploy：${jobUrl}`,
     ].join("\n") + branchCheckWarn;
   }
-  return [
+  const result = [
     `✅ 已部署 ${job}`,
     `分支: ${from === branch ? `${branch}（未变更，直接重新构建）` : `${from} → ${branch}`}`,
     build
       ? `构建: #${build}  ${jobUrl}${build}/`
       : `构建: 已入队（构建号未及取到）  ${jobUrl}`,
   ].join("\n") + branchCheckWarn;
+  return logUpdateError
+    ? `${result}\n⚠️ 构建号 #${build} 未能补记到部署账本：${logUpdateError}；分支变更记录已保留，可正常回滚。`
+    : result;
 }
 
 // ─── list_history ────────────────────────────────────────────────────────────

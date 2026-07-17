@@ -14,10 +14,10 @@ function authHeader(): string {
 }
 
 /** GET {JENKINS_URL}{path}，Basic Auth，带超时 */
-export async function jenkinsGet(path: string): Promise<string> {
+export async function jenkinsGet(path: string, timeoutMs = FETCH_TIMEOUT_MS): Promise<string> {
   const res = await fetch(requireEnv("JENKINS_URL") + path, {
     headers: { Authorization: authHeader() },
-    signal: AbortSignal.timeout(FETCH_TIMEOUT_MS),
+    signal: AbortSignal.timeout(timeoutMs),
   });
   if (!res.ok) throw new Error(`Jenkins ${path} 返回 ${res.status}`);
   return res.text();
@@ -148,11 +148,14 @@ export async function triggerBuild(name: string): Promise<number | null> {
     const basePath = new URL(base).pathname.replace(/\/$/, "");
     let itemPath = new URL(queueUrl, base + "/").pathname;
     if (basePath && itemPath.startsWith(basePath)) itemPath = itemPath.slice(basePath.length);
-    // 窗口须盖住 quiet period + 执行器排队的叠加（真机实测：静默 ~5.5s，QAT/HOT 连续部署挤同一节点时
-    // 排队再 +5s，共 10.5s，8s 窗口差 2.5s 错过）。取到号即提前退出，加长只花在慢尾，快路径零成本。
-    for (let i = 0; i < 15; i++) {
-      await new Promise((r) => setTimeout(r, 1000));
-      const item = JSON.parse(await jenkinsGet(`${itemPath}api/json`)) as {
+    // 15s 总窗口须盖住 quiet period + 执行器排队（真机实测约 10.5s）；使用绝对 deadline，
+    // 避免 15 次请求各自再等待 15s，令 MCP 调用在慢 Jenkins 上远超预期。
+    const deadline = Date.now() + 15_000;
+    while (Date.now() < deadline) {
+      await new Promise((r) => setTimeout(r, Math.min(1000, deadline - Date.now())));
+      const remaining = deadline - Date.now();
+      if (remaining <= 0) break;
+      const item = JSON.parse(await jenkinsGet(`${itemPath}api/json`, remaining)) as {
         executable?: { number: number };
       };
       if (item.executable) return item.executable.number;

@@ -2,6 +2,7 @@
 // 纯函数、无需 env；跑法：npm run self-check
 
 import { setBranchInConfigXml, stripBranchPrefix, unescapeXml } from "./jenkins.js";
+import { collapseDeployRecords, type DeployRecord } from "./history.js";
 import { gitlabInstanceAlias, matchJobs, normalizeRepo, type JobInfo } from "./match.js";
 
 export function runSelfCheck(): void {
@@ -80,5 +81,23 @@ export function runSelfCheck(): void {
   eq(stripBranchPrefix("origin/dev"), "dev");
   eq(stripBranchPrefix("dev"), "dev");
   eq(unescapeXml("a&amp;b &#xd; &apos;"), "a&b \r '");
+
+  // ── 部署日志：pending + 构建号更新须折叠为一条，旧格式无 id 的记录保持原样 ──
+  const baseRecord = {
+    id: "deploy-1",
+    time: "2026-07-17T00:00:00.000Z",
+    job: "TEST-hot-app",
+    from: "master",
+    to: "feature",
+    op: "deploy",
+  } as const;
+  const collapsed = collapseDeployRecords([
+    { ...baseRecord, build: 42 },
+    { ...baseRecord, build: null },
+    { time: baseRecord.time, job: baseRecord.job, from: "old", to: "master", build: 41 },
+  ] satisfies DeployRecord[]);
+  if (collapsed.length !== 2 || collapsed[0].build !== 42 || collapsed[1].build !== 41) {
+    throw new Error("self-check 失败: 部署日志 pending/final 折叠");
+  }
   console.log("self-check ok");
 }

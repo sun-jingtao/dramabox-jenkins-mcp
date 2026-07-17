@@ -9,6 +9,7 @@ const LOG_DIR = join(homedir(), ".dramabox-jenkins-mcp");
 const LOG_FILE = join(LOG_DIR, "deploy-log.jsonl");
 
 export interface DeployRecord {
+  id?: string; // 同一次部署的 pending/final 记录共用；旧记录无 id，保持兼容
   time: string; // ISO 时间
   job: string;
   from: string; // 改动前分支
@@ -20,6 +21,17 @@ export interface DeployRecord {
 export function appendDeployLog(rec: DeployRecord): void {
   mkdirSync(LOG_DIR, { recursive: true, mode: 0o700 });
   appendFileSync(LOG_FILE, JSON.stringify(rec) + "\n", { encoding: "utf-8", mode: 0o600 });
+}
+
+/** 输入最新在前；同一部署若先记 pending、后补构建号，只保留最新状态。旧记录无 id，不折叠。 */
+export function collapseDeployRecords(records: DeployRecord[]): DeployRecord[] {
+  const seen = new Set<string>();
+  return records.filter((record) => {
+    if (!record.id) return true;
+    if (seen.has(record.id)) return false;
+    seen.add(record.id);
+    return true;
+  });
 }
 
 /** 读取某个 Job 的操作记录，最新在前；job 省略时返回全部。坏行（进程被杀写半行等）跳过并计数。 */
@@ -39,5 +51,5 @@ export function readDeployLog(job?: string): { records: DeployRecord[]; corrupt:
     })
     .filter((r): r is DeployRecord => r !== null && (!job || r.job === job))
     .reverse();
-  return { records, corrupt };
+  return { records: collapseDeployRecords(records), corrupt };
 }
