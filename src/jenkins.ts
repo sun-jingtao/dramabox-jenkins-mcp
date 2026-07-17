@@ -148,7 +148,9 @@ export async function triggerBuild(name: string): Promise<number | null> {
     const basePath = new URL(base).pathname.replace(/\/$/, "");
     let itemPath = new URL(queueUrl, base + "/").pathname;
     if (basePath && itemPath.startsWith(basePath)) itemPath = itemPath.slice(basePath.length);
-    for (let i = 0; i < 5; i++) {
+    // 窗口须盖住 quiet period + 执行器排队的叠加（真机实测：静默 ~5.5s，QAT/HOT 连续部署挤同一节点时
+    // 排队再 +5s，共 10.5s，8s 窗口差 2.5s 错过）。取到号即提前退出，加长只花在慢尾，快路径零成本。
+    for (let i = 0; i < 15; i++) {
       await new Promise((r) => setTimeout(r, 1000));
       const item = JSON.parse(await jenkinsGet(`${itemPath}api/json`)) as {
         executable?: { number: number };
