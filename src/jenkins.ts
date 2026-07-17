@@ -123,7 +123,13 @@ export async function updateJobBranch(name: string, newBranch: string): Promise<
   } catch (e) {
     throw new Error(`Job ${name} 的 ${(e as Error).message}`);
   }
-  await jenkinsPost(`/job/${encodeURIComponent(name)}/config.xml`, result.updated, "application/xml");
+  // charset=UTF-8 必带：Jenkins 2.470 对裸 application/xml 写回 config 返回 500（实测对照：
+  // 裸 xml→HOT/QAT 均 500；带 charset→均 200。降 XML 声明 1.1→1.0 不充分，QAT 仍 500，故不改内容只改 header）
+  await jenkinsPost(
+    `/job/${encodeURIComponent(name)}/config.xml`,
+    result.updated,
+    "application/xml;charset=UTF-8"
+  );
   // 同步 jobCache，否则同进程内 find_job 会继续报旧分支
   const cached = jobCache?.find((j) => j.name === name);
   if (cached) cached.branch = newBranch;
