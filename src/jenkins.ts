@@ -173,7 +173,24 @@ export interface LastBuild {
   result: string; // SUCCESS / FAILURE / ABORTED / BUILDING…
   timestamp: number;
   url: string;
-  startedBy?: string; // 触发者（userName；非人工触发时为 cause 描述，如 SCM change）
+  trigger?: BuildTrigger;
+}
+
+export type BuildTrigger =
+  | { kind: "user"; label: string }
+  | { kind: "cause"; label: string };
+
+interface BuildCause {
+  userName?: string;
+  shortDescription?: string;
+}
+
+/** 人工触发优先返回用户名；否则保留 Jenkins 的完整 cause 描述，展示层不再二次包装。 */
+export function parseBuildTrigger(causes: BuildCause[]): BuildTrigger | undefined {
+  const userName = causes.find((cause) => cause.userName)?.userName;
+  if (userName) return { kind: "user", label: userName };
+  const description = causes.find((cause) => cause.shortDescription)?.shortDescription;
+  return description ? { kind: "cause", label: description } : undefined;
 }
 
 export interface JobStatus extends JobInfo {
@@ -201,7 +218,7 @@ export async function getJobStatus(name: string): Promise<JobStatus> {
       timestamp: number;
       url: string;
       building: boolean;
-      actions?: { causes?: { userName?: string; shortDescription?: string }[] }[];
+      actions?: { causes?: BuildCause[] }[];
     };
     // tree 是白名单：不显式要 causes 字段 Jenkins 就不返回（此前「查不到部署人」的根因）
     const causes = (b.actions ?? []).flatMap((a) => a?.causes ?? []);
@@ -210,7 +227,7 @@ export async function getJobStatus(name: string): Promise<JobStatus> {
       result: b.building ? "BUILDING" : (b.result ?? "?"),
       timestamp: b.timestamp,
       url: b.url,
-      startedBy: causes.find((c) => c.userName)?.userName ?? causes[0]?.shortDescription,
+      trigger: parseBuildTrigger(causes),
     };
   } catch (e) {
     // 仅 404 = 从未构建；5xx/超时等是查询失败，混淆两者会误导「Job 近期是否被占用」的判断

@@ -1,7 +1,7 @@
 // ─── 自检：守护 normalizeRepo 归一化与 matchJobs 匹配规则（每条断言对应一个真实踩过的坑）─
 // 纯函数、无需 env；跑法：npm run self-check
 
-import { setBranchInConfigXml, stripBranchPrefix, unescapeXml } from "./jenkins.js";
+import { parseBuildTrigger, setBranchInConfigXml, stripBranchPrefix, unescapeXml } from "./jenkins.js";
 import { collapseDeployRecords, type DeployRecord } from "./history.js";
 import { gitlabInstanceAlias, matchJobs, normalizeRepo, type JobInfo } from "./match.js";
 
@@ -61,11 +61,22 @@ export function runSelfCheck(): void {
   // env 过滤须按分隔符切词全等：hotfix 含 "hot" 不得被 env=hot 误命中（子串陷阱）
   const hotfixJobs: JobInfo[] = [
     { name: "TEST-hot-app", remote: "git@192.168.0.31:fe/app.git", repo: "gitlab31:fe/app", branch: "master" },
+    { name: "TEST-qat-app", remote: "git@192.168.0.31:fe/app.git", repo: "gitlab31:fe/app", branch: "master" },
+    { name: "TEST-qat2-app", remote: "git@192.168.0.31:fe/app.git", repo: "gitlab31:fe/app", branch: "master" },
     { name: "TEST-qat-hotfix-app", remote: "git@192.168.0.31:fe/app.git", repo: "gitlab31:fe/app", branch: "master" },
   ];
-  const hotHits = matchJobs(hotfixJobs, [{ path: "fe/app", key: "gitlab31:fe/app" }], "app", "hot");
+  const appProject = [{ path: "fe/app", key: "gitlab31:fe/app" }];
+  const hotHits = matchJobs(hotfixJobs, appProject, "app", "hot");
   if (hotHits.length !== 1 || hotHits[0].name !== "TEST-hot-app") {
     throw new Error(`self-check 失败: env=hot 误命中 hotfix，实际 ${hotHits.map((j) => j.name).join(",")}`);
+  }
+  const qatHits = matchJobs(hotfixJobs, appProject, "app", "qat");
+  if (qatHits.length !== 2 || qatHits.some((job) => job.name.includes("qat2"))) {
+    throw new Error(`self-check 失败: env=qat 与 qat2 未隔离，实际 ${qatHits.map((j) => j.name).join(",")}`);
+  }
+  const qat2Hits = matchJobs(hotfixJobs, appProject, "app", "qat2");
+  if (qat2Hits.length !== 1 || qat2Hits[0].name !== "TEST-qat2-app") {
+    throw new Error(`self-check 失败: env=qat2 精确过滤，实际 ${qat2Hits.map((j) => j.name).join(",")}`);
   }
 
   // ── config.xml 写路径：$ 替换陷阱与实体往返（评审实测复现过的 bug）──
@@ -81,6 +92,19 @@ export function runSelfCheck(): void {
   eq(stripBranchPrefix("origin/dev"), "dev");
   eq(stripBranchPrefix("dev"), "dev");
   eq(unescapeXml("a&amp;b &#xd; &apos;"), "a&b \r '");
+
+  // ── 构建触发来源：人工用户优先；非人工 cause 保留完整描述，避免「由 Started by...触发」──
+  const userTrigger = parseBuildTrigger([
+    { shortDescription: "Started by an SCM change" },
+    { userName: "admin", shortDescription: "Started by user admin" },
+  ]);
+  if (userTrigger?.kind !== "user" || userTrigger.label !== "admin") {
+    throw new Error("self-check 失败: 人工构建触发者解析");
+  }
+  const scmTrigger = parseBuildTrigger([{ shortDescription: "Started by an SCM change" }]);
+  if (scmTrigger?.kind !== "cause" || scmTrigger.label !== "Started by an SCM change") {
+    throw new Error("self-check 失败: 非人工构建 cause 解析");
+  }
 
   // ── 部署日志：pending + 构建号更新须折叠为一条，旧格式无 id 的记录保持原样 ──
   const baseRecord = {

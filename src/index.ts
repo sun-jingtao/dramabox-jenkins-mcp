@@ -2,6 +2,7 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { assertEnv } from "./env.js";
+import type { DeploymentEnv } from "./match.js";
 import { runSelfCheck } from "./self-check.js";
 import { registerTools, runDeploy, runFindJob, runGetStatus, runListHistory, runRollback } from "./tools.js";
 
@@ -11,9 +12,9 @@ registerTools(server);
 if (process.argv.includes("--self-check")) {
   runSelfCheck();
 } else if (process.argv[2] === "--find") {
-  // 本地调试：node dist/index.js --find <repo> [hot|qat]
+  // 本地调试：node dist/index.js --find <repo> [hot|qat|qat2]
   assertEnv();
-  console.log(await runFindJob(process.argv[3] ?? "", process.argv[4] as "hot" | "qat" | undefined));
+  console.log(await runFindJob(process.argv[3] ?? "", process.argv[4] as DeploymentEnv | undefined));
 } else if (process.argv[2] === "--status") {
   // 本地调试：node dist/index.js --status <job>
   assertEnv();

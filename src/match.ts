@@ -2,8 +2,9 @@
 // 唯一硬约束是 Job 部署时真正 checkout 的仓库地址（config.xml 的 <url>）。
 // 两端归一化成 `host别名:group/repo` 后全等比较；保留 host，跨实例同名 path 不会串。
 
-// 校准旋钮：同一 GitLab 实例的内网 IP / 域名映射到同一别名。换 IP、加实例只改这张表；
-// 表外的 host 会被 audit 报为形态漂移，不会静默漏配。
+// 校准旋钮：同一 GitLab 实例的内网 IP / 域名映射到同一别名。GITLAB_URL 与 Job remote
+// 若不是字面相同的 host，必须在此映射到同一别名，否则跨实例守卫会 fail closed。换 IP、
+// 域名或实例时只改这张表；表外 host 会被 audit 报为形态漂移，不会静默漏配。
 const HOST_ALIAS: Record<string, string> = {
   "192.168.0.31": "gitlab31",
   "gitlab31.dhwaj.cn": "gitlab31",
@@ -26,6 +27,9 @@ export interface GitlabProject {
   path: string;
   key: string | null;
 }
+
+export const DEPLOYMENT_ENVS = ["hot", "qat", "qat2"] as const;
+export type DeploymentEnv = (typeof DEPLOYMENT_ENVS)[number];
 
 // ─── 归一化 ─────────────────────────────────────────────────────────────────
 
@@ -77,13 +81,13 @@ function isKnownHost(url: string): boolean {
  * - GitLab search 是模糊召回（"dramabox_other" 也会召回 "dramabox_other_webpay"）：
  *   若有项目名与关键词精确相等，则只用精确项，防止子串近邻混入候选。
  * - GitLab 无命中 → 直接空结果（由调用方提示），绝不降级为子串匹配。
- * - envFilter：Job 名包含 hot / qat
+ * - envFilter：Job 名按分隔符切词后精确包含 hot / qat / qat2
  */
 export function matchJobs(
   jobs: JobInfo[],
   projects: GitlabProject[],
   repo: string,
-  envFilter?: "hot" | "qat"
+  envFilter?: DeploymentEnv
 ): JobInfo[] {
   const kw = repo.trim().toLowerCase();
   const exact = projects.filter(

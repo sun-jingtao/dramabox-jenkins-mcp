@@ -9,7 +9,14 @@ import { requireEnv } from "./env.js";
 import { getJobStatus, listJenkinsJobs, triggerBuild, updateJobBranch } from "./jenkins.js";
 import { branchExists, getMergeStatus, getProjectByPath, searchGitlabProjects, type MergeStatus } from "./gitlab.js";
 import { appendDeployLog, readDeployLog } from "./history.js";
-import { auditWarnings, gitlabInstanceAlias, matchJobs, type GitlabProject } from "./match.js";
+import {
+  DEPLOYMENT_ENVS,
+  auditWarnings,
+  gitlabInstanceAlias,
+  matchJobs,
+  type DeploymentEnv,
+  type GitlabProject,
+} from "./match.js";
 
 /** Job 仓库 host 别名是否与当前连接的 GITLAB_URL 同属一个实例。
  *  不同实例下同名 path 会指向错误项目，防覆盖须按「无法确认」拦截，绝不跨实例查询后放行。 */
@@ -25,10 +32,10 @@ export function registerTools(server: McpServer): void {
     {
       title: "定位 Jenkins Job",
       description:
-        "按 GitLab 仓库定位 Jenkins HOT/QAT 候选 Job，返回 Job 名、当前分支、仓库地址和链接。多环境时返回列表供确认。",
+        "按 GitLab 仓库定位 Jenkins HOT/QAT/QAT2 候选 Job，返回 Job 名、当前分支、仓库地址和链接。多环境时返回列表供确认。",
       inputSchema: {
         repo: z.string().describe("GitLab 仓库名或关键词，如 dramabox_other"),
-        env: z.enum(["hot", "qat"]).optional().describe("环境过滤：hot / qat；不传则返回全部候选"),
+        env: z.enum(DEPLOYMENT_ENVS).optional().describe("环境过滤：hot / qat / qat2；不传则返回全部候选"),
       },
       annotations: { readOnlyHint: true },
     },
@@ -111,7 +118,7 @@ export function registerTools(server: McpServer): void {
 // ─── find_job ────────────────────────────────────────────────────────────────
 
 /** 按仓库关键词定位候选 Job：GitLab 搜项目 → 归一化键全等匹配 Jenkins Job → env 过滤，附 audit 告警 */
-export async function runFindJob(repo: string, envFilter?: "hot" | "qat"): Promise<string> {
+export async function runFindJob(repo: string, envFilter?: DeploymentEnv): Promise<string> {
   const jobs = await listJenkinsJobs();
   let projects: GitlabProject[];
   try {
@@ -158,9 +165,15 @@ export async function runGetStatus(job: string): Promise<string> {
 
   const lines = [`Job: ${job}`, `当前部署分支: ${status.branch || "(未配置)"}`];
 
+  const triggerText = status.lastBuild?.trigger
+    ? status.lastBuild.trigger.kind === "user"
+      ? ` 由 ${status.lastBuild.trigger.label} 触发`
+      : ` ${status.lastBuild.trigger.label}`
+    : "";
+
   lines.push(
     status.lastBuild
-      ? `最近构建: #${status.lastBuild.number} ${status.lastBuild.result} (${new Date(status.lastBuild.timestamp).toLocaleString("zh-CN")})${status.lastBuild.startedBy ? ` 由 ${status.lastBuild.startedBy} 触发` : ""}\n  ${status.lastBuild.url}`
+      ? `最近构建: #${status.lastBuild.number} ${status.lastBuild.result} (${new Date(status.lastBuild.timestamp).toLocaleString("zh-CN")})${triggerText}\n  ${status.lastBuild.url}`
       : status.lastBuildError
         ? `最近构建: ⚠️ 查询失败（${status.lastBuildError}），非「从未构建」`
         : "最近构建: 从未构建"
