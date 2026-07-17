@@ -159,7 +159,7 @@ export async function runGetStatus(job: string): Promise<string> {
 
   lines.push(
     status.lastBuild
-      ? `最近构建: #${status.lastBuild.number} ${status.lastBuild.result} (${new Date(status.lastBuild.timestamp).toLocaleString("zh-CN")})\n  ${status.lastBuild.url}`
+      ? `最近构建: #${status.lastBuild.number} ${status.lastBuild.result} (${new Date(status.lastBuild.timestamp).toLocaleString("zh-CN")})${status.lastBuild.startedBy ? ` 由 ${status.lastBuild.startedBy} 触发` : ""}\n  ${status.lastBuild.url}`
       : status.lastBuildError
         ? `最近构建: ⚠️ 查询失败（${status.lastBuildError}），非「从未构建」`
         : "最近构建: 从未构建"

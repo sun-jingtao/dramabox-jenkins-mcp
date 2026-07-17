@@ -170,6 +170,7 @@ export interface LastBuild {
   result: string; // SUCCESS / FAILURE / ABORTED / BUILDING…
   timestamp: number;
   url: string;
+  startedBy?: string; // 触发者（userName；非人工触发时为 cause 描述，如 SCM change）
 }
 
 export interface JobStatus extends JobInfo {
@@ -189,14 +190,24 @@ export async function getJobStatus(name: string): Promise<JobStatus> {
   try {
     const b = JSON.parse(
       await jenkinsGet(
-        `/job/${encodeURIComponent(name)}/lastBuild/api/json?tree=number,result,timestamp,url,building`
+        `/job/${encodeURIComponent(name)}/lastBuild/api/json?tree=number,result,timestamp,url,building,actions[causes[userName,shortDescription]]`
       )
-    ) as { number: number; result: string | null; timestamp: number; url: string; building: boolean };
+    ) as {
+      number: number;
+      result: string | null;
+      timestamp: number;
+      url: string;
+      building: boolean;
+      actions?: { causes?: { userName?: string; shortDescription?: string }[] }[];
+    };
+    // tree 是白名单：不显式要 causes 字段 Jenkins 就不返回（此前「查不到部署人」的根因）
+    const causes = (b.actions ?? []).flatMap((a) => a?.causes ?? []);
     lastBuild = {
       number: b.number,
       result: b.building ? "BUILDING" : (b.result ?? "?"),
       timestamp: b.timestamp,
       url: b.url,
+      startedBy: causes.find((c) => c.userName)?.userName ?? causes[0]?.shortDescription,
     };
   } catch (e) {
     // 仅 404 = 从未构建；5xx/超时等是查询失败，混淆两者会误导「Job 近期是否被占用」的判断
