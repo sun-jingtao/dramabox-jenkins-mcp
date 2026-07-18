@@ -66,19 +66,26 @@ export function createGitlabClient(options: GitlabClientOptions = {}) {
     return result !== null;
   };
 
-  /** true = deployed SHA is on default branch; false = explicitly not; null = unknown. */
-  const isCommitMergedToDefaultBranch = async (
+  const queryCommitMergedToDefaultBranch = async (
     project: ProjectRef,
     deployedSha: string
   ): Promise<boolean | null> => {
     const params = new URLSearchParams();
     params.append("refs[]", deployedSha);
     params.append("refs[]", project.defaultBranch);
+    const mergeBase = await gitlabGet<{ id: string }>(
+      `/projects/${project.id}/repository/merge_base?${params.toString()}`
+    );
+    return mergeBase ? mergeBase.id.toLowerCase() === deployedSha.toLowerCase() : null;
+  };
+
+  /** true = deployed SHA is on default branch; false = explicitly not; null = unknown. */
+  const isCommitMergedToDefaultBranch = async (
+    project: ProjectRef,
+    deployedSha: string
+  ): Promise<boolean | null> => {
     try {
-      const mergeBase = await gitlabGet<{ id: string }>(
-        `/projects/${project.id}/repository/merge_base?${params.toString()}`
-      );
-      return mergeBase ? mergeBase.id.toLowerCase() === deployedSha.toLowerCase() : null;
+      return await queryCommitMergedToDefaultBranch(project, deployedSha);
     } catch {
       return null;
     }
@@ -94,7 +101,15 @@ export function createGitlabClient(options: GitlabClientOptions = {}) {
     deployedSha: string,
     deployedBranch?: string | null
   ): Promise<MergeStatus> => {
-    const merged = await isCommitMergedToDefaultBranch(project, deployedSha);
+    let merged: boolean | null;
+    try {
+      merged = await queryCommitMergedToDefaultBranch(project, deployedSha);
+    } catch (error) {
+      return {
+        state: "unknown",
+        detail: `GitLab merge_base 查询失败：${(error as Error).message}`,
+      };
+    }
     if (merged === true) {
       return {
         state: "merged",

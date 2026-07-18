@@ -15,7 +15,7 @@ import {
   type JobStatus,
 } from "./jenkins.js";
 import { gitlabInstanceAlias, matchJobs, normalizeRepo, type JobInfo } from "./match.js";
-import { runDeploy, type ToolDependencies } from "./tools.js";
+import { runDeploy, runGetStatus, type ToolDependencies } from "./tools.js";
 
 export async function runSelfCheck(): Promise<void> {
   const eq = (a: unknown, b: unknown) => {
@@ -261,6 +261,7 @@ export async function runSelfCheck(): Promise<void> {
       const url = new URL(input instanceof Request ? input.url : input.toString());
       const [sha] = url.searchParams.getAll("refs[]");
       if (sha === "missing") return jsonResponse({}, 404);
+      if (sha === "server-error") return jsonResponse({}, 500);
       return jsonResponse({ id: sha === "abc123" ? "abc123" : "common-base" });
     },
   });
@@ -268,6 +269,11 @@ export async function runSelfCheck(): Promise<void> {
   eq(await gitlabMock.isCommitMergedToDefaultBranch(project, "abc123"), true);
   eq(await gitlabMock.isCommitMergedToDefaultBranch(project, "def456"), false);
   eq(await gitlabMock.isCommitMergedToDefaultBranch(project, "missing"), null);
+  eq(await gitlabMock.isCommitMergedToDefaultBranch(project, "server-error"), null);
+  const mergeBaseError = await gitlabMock.getCommitMergeStatus(project, "server-error");
+  if (mergeBaseError.state !== "unknown" || !mergeBaseError.detail.includes("返回 500")) {
+    throw new Error("self-check 失败: merge_base unknown 应保留具体 HTTP 错误");
+  }
 
   // ── deploy orchestration: same branch, cross branch, and hard concurrency blocks ──
   const deployedBuild: JenkinsBuildInfo = {
@@ -299,6 +305,8 @@ export async function runSelfCheck(): Promise<void> {
   let mergeCalls = 0;
   let triggerCalls = 0;
   let updateCalls = 0;
+  let branchExistsError = false;
+  let branchExistsResult = true;
   let mergeState: MergeStatus = { state: "not_merged", detail: "abc123 尚未进入 master" };
   let currentStatus = baseStatus;
   const toolDeps: ToolDependencies = {
@@ -315,7 +323,10 @@ export async function runSelfCheck(): Promise<void> {
     },
     searchGitlabProjects: async () => [],
     getProjectByPath: async () => project,
-    branchExists: async () => true,
+    branchExists: async () => {
+      if (branchExistsError) throw new Error("GitLab branch API 返回 503");
+      return branchExistsResult;
+    },
     getCommitMergeStatus: async (): Promise<MergeStatus> => {
       mergeCalls++;
       return mergeState;
@@ -360,6 +371,10 @@ export async function runSelfCheck(): Promise<void> {
   }
   eq(triggerCalls, 2);
   currentStatus = { ...baseStatus, lastBuild: null, deployedBuild: null };
+  const noStableStatusText = await runGetStatus("TEST-hot-app", toolDeps);
+  if (noStableStatusText.includes("缺少匹配当前仓库的 Git BuildData")) {
+    throw new Error("self-check 失败: 无 lastStableBuild 时不得误报 BuildData 缺失");
+  }
   const firstDeployBlocked = await runDeploy("TEST-hot-app", "feature-a", false, toolDeps);
   if (!firstDeployBlocked.includes("没有可用的 lastStableBuild")) {
     throw new Error("self-check 失败: 新 Job 首次部署必须 fail-closed");
@@ -369,6 +384,25 @@ export async function runSelfCheck(): Promise<void> {
     throw new Error("self-check 失败: 新 Job 获得明确 force 后应允许首次部署");
   }
   eq(triggerCalls, 3);
+  currentStatus = baseStatus;
+  branchExistsError = true;
+  const branchCheckBlocked = await runDeploy("TEST-hot-app", "feature-a", false, toolDeps);
+  if (!branchCheckBlocked.includes("带 force=true 重试")) {
+    throw new Error("self-check 失败: branch 查询异常时非 force 必须拦截");
+  }
+  eq(triggerCalls, 3);
+  const branchCheckForced = await runDeploy("TEST-hot-app", "feature-a", true, toolDeps);
+  if (!branchCheckForced.includes("由 Jenkins 最终校验分支") || !branchCheckForced.includes("已触发")) {
+    throw new Error("self-check 失败: branch 查询异常时 force 应警告后继续");
+  }
+  eq(triggerCalls, 4);
+  branchExistsError = false;
+  branchExistsResult = false;
+  const missingBranchForced = await runDeploy("TEST-hot-app", "missing", true, toolDeps);
+  if (!missingBranchForced.includes("不存在分支 missing")) {
+    throw new Error("self-check 失败: 明确不存在的目标分支不能通过 force 绕过");
+  }
+  eq(triggerCalls, 4);
 
   console.log("self-check ok");
 }

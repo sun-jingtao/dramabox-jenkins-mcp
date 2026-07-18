@@ -256,7 +256,10 @@ export async function runGetStatus(
     return lines.join("\n");
   }
   lines.push(`仓库: ${status.remote}`);
-  const revision = status.deployedBuild?.revision;
+  if (!status.deployedBuild) {
+    return lines.join("\n");
+  }
+  const revision = status.deployedBuild.revision;
   if (!revision) {
     lines.push("成功部署版本合并状态: ⚠️ 无法确认 —— lastStableBuild 缺少匹配当前仓库的 Git BuildData");
     return lines.join("\n");
@@ -330,20 +333,27 @@ export async function runDeploy(
     projectError = "Job 未解析出静态 Git 仓库";
   }
 
+  let branchCheckWarning = "";
   if (project) {
     try {
       if (!(await deps.branchExists(project, targetBranch))) {
         return `🛑 已中止部署：GitLab 仓库 ${repoPath} 上不存在分支 ${targetBranch}，请检查分支名。`;
       }
     } catch (error) {
-      return `🛑 已中止部署：目标分支存在性查询失败（${(error as Error).message}），尚未修改 Jenkins 配置。`;
+      if (!force) {
+        return [
+          `🛑 已中止部署：目标分支存在性查询失败（${(error as Error).message}），尚未修改 Jenkins 配置。`,
+          "请向用户复述以上信息并获得明确同意后，带 force=true 重试。",
+        ].join("\n");
+      }
+      branchCheckWarning = `\n⚠️ 目标分支存在性查询失败（${(error as Error).message}）；已按用户确认使用 force=true 继续，由 Jenkins 最终校验分支。`;
     }
   }
 
   const revision = status.deployedBuild?.revision;
   const deployedBranch = getUniqueRevisionBranch(revision);
   const sameDeployedBranch = deployedBranch === targetBranch;
-  let protectionWarning = "";
+  let protectionWarning = branchCheckWarning;
 
   if (!project && !force) {
     return [
@@ -353,7 +363,7 @@ export async function runDeploy(
     ].join("\n");
   }
 
-  if (!sameDeployedBranch && !force) {
+  if (!sameDeployedBranch && !force && project) {
     let merge: MergeStatus;
     if (!status.deployedBuild) {
       const reason = status.deployedBuildError
@@ -362,8 +372,6 @@ export async function runDeploy(
       merge = { state: "unknown", detail: reason };
     } else if (!revision) {
       merge = { state: "unknown", detail: "lastStableBuild 缺少匹配当前仓库的 Git BuildData/SHA" };
-    } else if (!project) {
-      merge = { state: "unknown", detail: projectError };
     } else {
       merge = await deps
         .getCommitMergeStatus(project, revision.sha, deployedBranch)
@@ -380,9 +388,9 @@ export async function runDeploy(
       ].join("\n");
     }
   } else if (!sameDeployedBranch && force && project) {
-    protectionWarning = "\n⚠️ 已按用户确认使用 force=true，跳过最近成功部署版本的主干合并保护。";
+    protectionWarning += "\n⚠️ 已按用户确认使用 force=true，跳过最近成功部署版本的主干合并保护。";
   } else if (!project) {
-    protectionWarning = `\n⚠️ ${projectError}，本次 force 部署无法校验目标分支是否存在。`;
+    protectionWarning += `\n⚠️ ${projectError}，本次 force 部署无法校验目标分支是否存在。`;
   }
 
   // Narrow the race between protection checks and the config write.
