@@ -1,54 +1,22 @@
-// ─── GitLab API：搜项目、compare / MR 合并状态查询（防覆盖判断的数据源）─────
+// GitLab API: project lookup, target-branch validation, and commit ancestry.
 
 import { requireEnv } from "./env.js";
 import { normalizeRepo, type GitlabProject } from "./match.js";
 
-/** GET /api/v4{path}，PRIVATE-TOKEN 鉴权，带超时；404 返回 null，其余非 2xx 抛错 */
-async function gitlabGet<T>(path: string): Promise<T | null> {
-  const res = await fetch(`${requireEnv("GITLAB_URL")}/api/v4${path}`, {
-    headers: { "PRIVATE-TOKEN": requireEnv("GITLAB_TOKEN") },
-    signal: AbortSignal.timeout(15_000), // 对端挂起时防止 MCP 工具调用永久阻塞
-  });
-  if (res.status === 404) return null;
-  if (!res.ok) throw new Error(`GitLab ${path} 返回 ${res.status}`);
-  return (await res.json()) as T;
-}
+export type FetchLike = (
+  input: string | URL | Request,
+  init?: RequestInit
+) => Promise<Response>;
 
-/**
- * 接口：GET /api/v4/projects?membership=true&simple=true&search={keyword}
- * 用 PRIVATE-TOKEN 鉴权；返回当前用户有权限且名称命中的仓库。
- */
-export async function searchGitlabProjects(keyword: string): Promise<GitlabProject[]> {
-  const list = await gitlabGet<{ path_with_namespace: string; http_url_to_repo: string }[]>(
-    `/projects?membership=true&simple=true&per_page=100&search=${encodeURIComponent(keyword)}`
-  );
-  return (list ?? []).map((p) => ({
-    path: p.path_with_namespace,
-    key: normalizeRepo(p.http_url_to_repo),
-  }));
+export interface GitlabClientOptions {
+  fetchImpl?: FetchLike;
+  baseUrl?: string;
+  token?: string;
 }
-
-// ─── 合并状态（PRD 防覆盖规则）──────────────────────────────────────────────
 
 export interface ProjectRef {
   id: number;
   defaultBranch: string;
-}
-
-/** 按 path_with_namespace 精确取项目；查不到（不存在/无权限/另一 GitLab 实例）返回 null */
-export async function getProjectByPath(path: string): Promise<ProjectRef | null> {
-  const p = await gitlabGet<{ id: number; default_branch: string }>(
-    `/projects/${encodeURIComponent(path)}`
-  );
-  return p ? { id: p.id, defaultBranch: p.default_branch } : null;
-}
-
-/** 分支当前是否存在于仓库（deploy 目标分支校验用） */
-export async function branchExists(project: ProjectRef, branch: string): Promise<boolean> {
-  const b = await gitlabGet<{ name: string }>(
-    `/projects/${project.id}/repository/branches/${encodeURIComponent(branch)}`
-  );
-  return b !== null;
 }
 
 export interface MergeStatus {
@@ -56,54 +24,123 @@ export interface MergeStatus {
   detail: string;
 }
 
-/**
- * 判断分支是否已进入主干（PRD 第 4 节）：
- * - 是主干本身 → merged
- * - 分支存在 → compare 主干..分支，0 个独有提交 = merged；否则 not_merged
- *   （若有已合并 MR，detail 会提示可能为 squash / 合并后又有新提交，但不放松拦截）
- * - 分支已删除 → 只认 merged MR 记录；查不到 = unknown（不能仅凭分支不存在判定已合并）
- */
-export async function getMergeStatus(project: ProjectRef, branch: string): Promise<MergeStatus> {
-  const target = project.defaultBranch;
-  if (branch === target) {
-    return { state: "merged", detail: `就是主干分支 ${target}` };
-  }
+export function createGitlabClient(options: GitlabClientOptions = {}) {
+  const fetchImpl = options.fetchImpl ?? globalThis.fetch.bind(globalThis);
+  const connection = () => ({
+    baseUrl: (options.baseUrl ?? requireEnv("GITLAB_URL")).replace(/\/+$/, ""),
+    token: options.token ?? requireEnv("GITLAB_TOKEN"),
+  });
 
-  const findMergedMr = () =>
-    gitlabGet<{ iid: number }[]>(
-      `/projects/${project.id}/merge_requests?source_branch=${encodeURIComponent(branch)}&target_branch=${encodeURIComponent(target)}&state=merged&per_page=1`
-    );
+  const gitlabGet = async <T>(path: string): Promise<T | null> => {
+    const { baseUrl, token } = connection();
+    const response = await fetchImpl(`${baseUrl}/api/v4${path}`, {
+      headers: { "PRIVATE-TOKEN": token },
+      signal: AbortSignal.timeout(15_000),
+    });
+    if (response.status === 404) return null;
+    if (!response.ok) throw new Error(`GitLab ${path} 返回 ${response.status}`);
+    return (await response.json()) as T;
+  };
 
-  const exists = await gitlabGet<{ name: string }>(
-    `/projects/${project.id}/repository/branches/${encodeURIComponent(branch)}`
-  );
-  if (exists) {
-    const cmp = await gitlabGet<{ commits: unknown[] }>(
-      `/projects/${project.id}/repository/compare?from=${encodeURIComponent(target)}&to=${encodeURIComponent(branch)}`
+  const searchGitlabProjects = async (keyword: string): Promise<GitlabProject[]> => {
+    const projects = await gitlabGet<
+      { path_with_namespace: string; http_url_to_repo: string }[]
+    >(`/projects?membership=true&simple=true&per_page=100&search=${encodeURIComponent(keyword)}`);
+    return (projects ?? []).map((project) => ({
+      path: project.path_with_namespace,
+      key: normalizeRepo(project.http_url_to_repo),
+    }));
+  };
+
+  const getProjectByPath = async (path: string): Promise<ProjectRef | null> => {
+    const project = await gitlabGet<{ id: number; default_branch: string }>(
+      `/projects/${encodeURIComponent(path)}`
     );
-    if (!cmp) return { state: "unknown", detail: "compare 接口查询失败" };
-    if (cmp.commits.length === 0) {
-      return { state: "merged", detail: `分支提交已全部进入 ${target}` };
+    return project ? { id: project.id, defaultBranch: project.default_branch } : null;
+  };
+
+  const branchExists = async (project: ProjectRef, branch: string): Promise<boolean> => {
+    const result = await gitlabGet<{ name: string }>(
+      `/projects/${project.id}/repository/branches/${encodeURIComponent(branch)}`
+    );
+    return result !== null;
+  };
+
+  /** true = deployed SHA is on default branch; false = explicitly not; null = unknown. */
+  const isCommitMergedToDefaultBranch = async (
+    project: ProjectRef,
+    deployedSha: string
+  ): Promise<boolean | null> => {
+    const params = new URLSearchParams();
+    params.append("refs[]", deployedSha);
+    params.append("refs[]", project.defaultBranch);
+    try {
+      const mergeBase = await gitlabGet<{ id: string }>(
+        `/projects/${project.id}/repository/merge_base?${params.toString()}`
+      );
+      return mergeBase ? mergeBase.id.toLowerCase() === deployedSha.toLowerCase() : null;
+    } catch {
+      return null;
     }
-    // squash 合并后 tip 不在主干，compare 恒有领先；补查 merged MR 供人判断，但不放松拦截
-    // （MR 合并后分支可能又有新提交，自动放行有覆盖风险）
-    const mrs = await findMergedMr();
-    const squashHint =
-      mrs && mrs.length > 0
-        ? `；存在已合并 MR !${mrs[0].iid} 但 compare 仍领先——可能是 squash 合并，也可能合并后又有新提交，确认无未合并改动后可 force`
-        : "";
+  };
+
+  const findMergedMr = async (project: ProjectRef, branch: string) =>
+    gitlabGet<{ iid: number }[]>(
+      `/projects/${project.id}/merge_requests?source_branch=${encodeURIComponent(branch)}&target_branch=${encodeURIComponent(project.defaultBranch)}&state=merged&per_page=1`
+    );
+
+  const getCommitMergeStatus = async (
+    project: ProjectRef,
+    deployedSha: string,
+    deployedBranch?: string | null
+  ): Promise<MergeStatus> => {
+    const merged = await isCommitMergedToDefaultBranch(project, deployedSha);
+    if (merged === true) {
+      return {
+        state: "merged",
+        detail: `${deployedSha.slice(0, 8)} 已进入主干 ${project.defaultBranch}`,
+      };
+    }
+    if (merged === null) {
+      return {
+        state: "unknown",
+        detail: `无法确认 ${deployedSha.slice(0, 8)} 是否已进入主干 ${project.defaultBranch}`,
+      };
+    }
+
+    let squashHint = "";
+    if (deployedBranch && deployedBranch !== project.defaultBranch) {
+      try {
+        const mergeRequests = await findMergedMr(project, deployedBranch);
+        if (mergeRequests && mergeRequests.length > 0) {
+          squashHint = `；发现来源分支 ${deployedBranch} 的已合并 MR !${mergeRequests[0].iid}，可能经过 squash，请人工确认后 force`;
+        }
+      } catch {
+        // MR is diagnostic only and must not change the ancestry decision.
+      }
+    }
     return {
       state: "not_merged",
-      detail: `领先 ${target} ${cmp.commits.length} 个提交，覆盖部署前需确认${squashHint}`,
+      detail: `${deployedSha.slice(0, 8)} 尚未进入主干 ${project.defaultBranch}${squashHint}`,
     };
-  }
+  };
 
-  // 有意的口径差异：分支存在时 MR 会被 compare 领先否决，这里却凭 MR 放行——
-  // 因为防覆盖保护的是「他人活跃分支上未合并的工作」，删除分支本身就是作者
-  // 已了结该分支的强信号；即使 MR 后还推过未合并提交，也是作者主动放弃的。
-  const mrs = await findMergedMr();
-  if (mrs && mrs.length > 0) {
-    return { state: "merged", detail: `分支已删除，存在已合并 MR !${mrs[0].iid}` };
-  }
-  return { state: "unknown", detail: "分支已删除且无已合并 MR 记录，无法确认，覆盖部署前需人工核对" };
+  return {
+    gitlabGet,
+    searchGitlabProjects,
+    getProjectByPath,
+    branchExists,
+    isCommitMergedToDefaultBranch,
+    getCommitMergeStatus,
+  };
 }
+
+export type GitlabClient = ReturnType<typeof createGitlabClient>;
+
+const defaultClient = createGitlabClient();
+
+export const searchGitlabProjects = defaultClient.searchGitlabProjects;
+export const getProjectByPath = defaultClient.getProjectByPath;
+export const branchExists = defaultClient.branchExists;
+export const isCommitMergedToDefaultBranch = defaultClient.isCommitMergedToDefaultBranch;
+export const getCommitMergeStatus = defaultClient.getCommitMergeStatus;

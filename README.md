@@ -2,7 +2,7 @@
 
 DramaBox Jenkins HOT/QAT/QAT2 部署助手（MCP Server），支持 Claude Code、Claude Desktop、Cursor 等任意 MCP 客户端。
 
-让 Agent 在对话里完成完整部署闭环：定位 Job → 查分支与合并状态 → 防覆盖检查后改分支并构建 → 记录可查、可回滚。全程不把 Token 贴进对话。
+让 Agent 在对话里完成完整部署闭环：定位 Job → 查询 Jenkins 真实构建状态 → 防覆盖检查 → 修改分支并触发构建。全程不把 Token 贴进对话。
 
 关联需求：[【PRD】Jenkins HOT/QAT 部署助手 MCP](https://www.tapd.cn/tapd_fe/59787500/story/detail/1159787500001022834)
 
@@ -78,33 +78,65 @@ npm run self-check
 
 > 帮我把 dramabox_other 的 HOT 环境部署到 sunjt-0716-fix 分支
 
-Agent 会自动串联：`find_job` 定位 → `deploy` 防覆盖检查后改分支构建。当前分支未合并进主干时会先告警，需要你明确同意后才覆盖。其他常用说法：
+Agent 会自动串联：`find_job` 定位 → `deploy` 防覆盖检查后改分支并触发构建。切换代码线且最近成功部署版本未进入主干时会先告警，需要你明确同意后才允许 `force`。其他常用说法：
 
-> dramabox_other 的 QAT 现在部的是什么分支？合并了吗？（→ find_job + get_status）
+> dramabox_other 的 QAT 当前配置、最近构建和最近成功部署分别是什么？（→ find_job + get_status）
 >
-> dramabox_other 的 QAT2 现在部的是什么分支？（→ find_job(env=qat2) + get_status）
->
-> 刚才部错了，帮我回滚 TEST-hot-dramabox-other（→ rollback）
->
-> 看下今天都部署过什么（→ list_history）
+> dramabox_other 的 QAT2 最近成功部署的是哪个分支和 commit？（→ find_job(env=qat2) + get_status）
 
 ## 已实现工具
 
 | 工具 | 作用 | 写操作 |
 | --- | --- | --- |
-| `find_job` | 按 GitLab 仓库定位候选 Job，返回 Job 名、当前分支、仓库地址和链接 | 否 |
-| `get_status` | Job 当前分支、最近构建、相对主干合并状态、Job 描述里的部署页线索 | 否 |
-| `deploy` | 防覆盖检查 → 改 BranchSpec → 触发构建 → 写操作日志 | **是** |
-| `list_history` | 查看经本工具执行的分支切换与构建记录（最新在前） | 否 |
-| `rollback` | 切回记录中最近一次分支变更前的分支并构建（同样过防覆盖检查）。语义是「撤销最近一次 deploy」，不是无限逐级回退；要回到更早的分支，用 list_history 查到目标后直接 deploy 即可 | **是** |
+| `find_job` | 按 GitLab 仓库定位候选 Job，返回 Job 名、Jenkins 当前配置分支、仓库地址和链接 | 否 |
+| `get_status` | 当前配置、最近构建尝试、最近严格成功部署、触发来源及主干合并状态 | 否 |
+| `deploy` | 并发与防覆盖检查 → 改 BranchSpec → 触发 Jenkins 构建 | **是** |
 
-**deploy / rollback 的防覆盖规则**（PRD 第 4 节）：
+## 状态口径
 
-- 目标 Job 当前分支已合并进主干 → 直接执行
-- 未合并或无法确认（含仓库属于另一 GitLab 实例、token 无权限）→ 中止并告警，需用户明确同意后带 `force=true` 重试
-- 分支已删除时只认已合并 MR 记录，不凭「分支不存在」判定已合并；删除分支视为作者已了结该分支，故凭 merged MR 放行（分支仍存在时则以 compare 为准，squash 合并后需 force）
-- 目标分支在 GitLab 上不存在 → 直接拒绝（防打错字触发必败构建）
+- `Jenkins 当前配置分支` 来自 `config.xml` BranchSpec，只表示下一次准备构建什么，不代表服务器正在运行什么。
+- `最近构建尝试` 来自 `lastBuild`，可能是 BUILDING、FAILURE、ABORTED 或 SUCCESS。
+- `最近一次成功部署` 来自 `lastStableBuild`，客户端还会再次要求 `result === "SUCCESS" && building === false`。
+- 实际 commit SHA 和 branch label 来自 Git Plugin `BuildData.lastBuiltRevision`；多 SCM 时必须由 `remoteUrls` 与 Job 仓库精确匹配。
+- Jenkins 构建开始时间为 `timestamp`，展示的完成时间使用 `timestamp + duration`，不声称是部署步骤的精确完成时刻。
 
-**匹配规则**：Job 与仓库的对应关系取自 Job `config.xml` 里实际 checkout 的仓库地址，归一化（IP↔域名、`.git` 后缀、斜杠、大小写）后与 GitLab 项目路径**全等**比较，与 Job 名称无关，无模糊回退。环境过滤支持 `hot`、`qat`、`qat2`，按 Job 名分隔词精确匹配，QAT 不会混入 QAT2。内网 IP ↔ 域名映射表在 `src/match.ts` 的 `HOST_ALIAS`：`GITLAB_URL` 与 Job remote 若不是字面相同的 host，必须映射到同一别名，否则跨实例守卫会按“无法确认”中止部署；换 IP、域名或实例时需对应修改。表外 host 会在 find_job 返回里以告警形式列出，不会静默漏配。
+## deploy 防覆盖规则
 
-**操作日志**：deploy / rollback 在修改分支后先向 `~/.dramabox-jenkins-mcp/deploy-log.jsonl` 追加 pending 记录，取得构建号后再追加同 ID 的状态更新；读取时折叠为一条逻辑部署记录（时间、Job、改动前后分支、构建号）。这样 MCP 在 queue 轮询期间退出也不会丢失 rollback 依据；旧格式日志保持兼容。list_history 与 rollback 都以它为数据源。
+1. Job 已在 queue 或 `lastBuild.building === true`：硬拦截，`force` 不能绕过。写配置前会再次检查，以缩小竞态窗口。
+2. 最近成功部署的实际分支与目标分支标准化后同名：直接允许重部署，包括个人分支 force-push 后再次部署。
+3. 分支名不同或 BuildData branch label 无法唯一确定：通过 GitLab `merge_base(deployedSha, defaultBranch)` 判断实际部署 SHA 是否已进入主干。
+4. SHA 已进入主干：允许切换分支；明确未进入或查询结果 unknown：要求用户确认后用 `force=true`。
+5. 无 `lastStableBuild`、构建历史轮转、BuildData 无法匹配、跨 GitLab 实例或 token 无权限：均按 unknown 处理，非 force 不修改 Jenkins。
+6. 目标分支明确不存在：始终拒绝。目标分支存在性请求失败时也不修改 Jenkins，避免把网络错误当作分支存在。
+
+同分支判断有一项明确接受的边界：分支删除后以同名重建，也会被当作同分支重部署。个人开发分支允许频繁 force-push 后，单靠 Git 历史无法同时区分“正常改写”和“同名重建”。如果 BuildData 返回多个不同的标准化 branch label，工具不会猜测唯一来源，而会进入跨分支检查。
+
+Squash merge 不保留原 deployed SHA，因此 `merge_base` 会判定该 SHA 未进入主干。工具可以根据 branch label 查询已合并 MR 并给出提示，但 MR 只用于辅助人工判断，不能自动放行。
+
+## 仓库与环境匹配
+
+Job 与仓库的对应关系取自 Job `config.xml` 的仓库地址，归一化 IP/域名、`.git` 后缀、斜杠和大小写后，与 GitLab 项目路径全等比较，不按 Job 名模糊猜测。环境过滤支持 `hot`、`qat`、`qat2`，按 Job 名分隔词精确匹配，QAT 不会混入 QAT2。
+
+内网 IP 与域名映射位于 `src/match.ts` 的 `HOST_ALIAS`。`GITLAB_URL` 和 Job remote 必须归一到同一实例，否则跨实例守卫会 fail-closed；换 IP、域名或实例时需要同步维护映射。
+
+## 已删除的旧能力
+
+`list_history`、`rollback` 和本地部署日志已从工具与 CLI 中删除。本地 JSONL 只能记录当前机器经本 MCP 发起的操作，无法覆盖其他用户直接通过 Jenkins 的部署，不能作为多人环境的权威历史。
+
+升级不会自动删除已有的 `~/.dramabox-jenkins-mcp/deploy-log.jsonl`，但程序不再读取它；确认不需要后可由用户自行清理。
+
+## 系统前提与待验证项
+
+- 已确认不存在绕过 Jenkins 的常规手工服务器部署路径。
+- 待真实 QAT/HOT 验证：Jenkins `SUCCESS` 必须等价于目标服务器实际部署成功。
+- 待真实 QAT/HOT 验证：FAILURE/ABORTED 不得留下服务器部分更新状态。
+- 如果上述前提不成立，应由服务器暴露 `/version`、release manifest、commit SHA 或制品 digest，并以运行时信息作为最终权威源。
+
+## 验证
+
+```bash
+npm run build
+npm run self-check
+```
+
+`self-check` 不访问外网，通过注入式 HTTP mock 覆盖 Jenkins BuildData、严格 SUCCESS、GitLab merge_base、同分支重部署、跨分支拦截和并发硬拦截。

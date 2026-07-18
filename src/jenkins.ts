@@ -1,99 +1,73 @@
-// ─── Jenkins API：读 Job 配置、改 BranchSpec、触发构建 ──────────────────────
+// Jenkins API: read real build state, update BranchSpec, and trigger builds.
 
 import { requireEnv } from "./env.js";
 import { normalizeRepo, type JobInfo } from "./match.js";
 
-// ponytail: 进程内缓存全量 Job；Cursor 重启即刷新。不够新鲜时再加 TTL。
-// updateJobBranch 写成功后会就地更新对应项，保证同进程内读写一致。
-let jobCache: JobInfo[] | null = null;
+const FETCH_TIMEOUT_MS = 15_000;
 
-const FETCH_TIMEOUT_MS = 15_000; // 对端挂起时防止 MCP 工具调用永久阻塞
+export type FetchLike = (
+  input: string | URL | Request,
+  init?: RequestInit
+) => Promise<Response>;
 
-function authHeader(): string {
-  return `Basic ${Buffer.from(`${requireEnv("JENKINS_USER")}:${requireEnv("JENKINS_TOKEN")}`).toString("base64")}`;
+export interface JenkinsClientOptions {
+  fetchImpl?: FetchLike;
+  baseUrl?: string;
+  user?: string;
+  token?: string;
 }
 
-/** GET {JENKINS_URL}{path}，Basic Auth，带超时 */
-export async function jenkinsGet(path: string, timeoutMs = FETCH_TIMEOUT_MS): Promise<string> {
-  const res = await fetch(requireEnv("JENKINS_URL") + path, {
-    headers: { Authorization: authHeader() },
-    signal: AbortSignal.timeout(timeoutMs),
-  });
-  if (!res.ok) throw new Error(`Jenkins ${path} 返回 ${res.status}`);
-  return res.text();
-}
-
-/**
- * POST，自适应 CSRF：API token 通常免 Crumb（Jenkins 2.96+），先直接发；
- * 若 403 再取 crumbIssuer（带回 session cookie）重试一次，两种实例配置都兼容。
- */
-async function jenkinsPost(path: string, body?: string, contentType?: string): Promise<Response> {
-  const base = requireEnv("JENKINS_URL");
-  const headers: Record<string, string> = { Authorization: authHeader() };
-  if (contentType) headers["Content-Type"] = contentType;
-
-  const signal = () => AbortSignal.timeout(FETCH_TIMEOUT_MS);
-  let res = await fetch(base + path, { method: "POST", headers, body, signal: signal() });
-  if (res.status === 403) {
-    const crumbRes = await fetch(base + "/crumbIssuer/api/json", {
-      headers: { Authorization: authHeader() },
-      signal: signal(),
-    });
-    if (crumbRes.ok) {
-      const { crumb, crumbRequestField } = (await crumbRes.json()) as {
-        crumb: string;
-        crumbRequestField: string;
-      };
-      // 多个 Set-Cookie 会被 get() 合并成一串，须用 getSetCookie 逐个找会话 cookie
-      const cookie = crumbRes.headers
-        .getSetCookie()
-        .map((c) => c.split(";")[0])
-        .find((c) => /session/i.test(c));
-      const retryHeaders = { ...headers, [crumbRequestField]: crumb };
-      if (cookie) retryHeaders["Cookie"] = cookie;
-      res = await fetch(base + path, { method: "POST", headers: retryHeaders, body, signal: signal() });
-    }
+export class JenkinsHttpError extends Error {
+  constructor(
+    readonly path: string,
+    readonly status: number
+  ) {
+    super(`Jenkins ${path} 返回 ${status}`);
   }
-  if (!res.ok) throw new Error(`Jenkins POST ${path} 返回 ${res.status}`);
-  return res;
 }
 
-// ─── config.xml 纯函数（无 IO，self-check 可测）────────────────────────────
+function authHeader(user: string, token: string): string {
+  return `Basic ${Buffer.from(`${user}:${token}`).toString("base64")}`;
+}
 
-/** BranchSpec 惯用前缀（星号斜杠、refs/heads/、origin/）剥成裸分支名，用于查 GitLab 与展示 */
+// ─── config.xml pure functions ──────────────────────────────────────────────
+
+/** Normalize Jenkins/Git branch labels to a bare branch name. */
 export function stripBranchPrefix(name: string): string {
-  return name.replace(/^(\*\/|refs\/heads\/|origin\/)/, "");
+  return name
+    .trim()
+    .replace(/^refs\/remotes\/origin\//, "")
+    .replace(/^refs\/heads\//, "")
+    .replace(/^origin\//, "")
+    .replace(/^\*\//, "");
 }
 
 function escapeXml(s: string): string {
   return s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
 }
 
-/** 反转义 XML 实体（数字实体先还原，&amp; 必须最后，防双重转义误还原） */
 export function unescapeXml(s: string): string {
   return s
     .replace(/&#x([0-9a-f]+);/gi, (_, h) => String.fromCodePoint(parseInt(h, 16)))
     .replace(/&#(\d+);/g, (_, d) => String.fromCodePoint(Number(d)))
-    .replace(/&lt;/g, "<").replace(/&gt;/g, ">").replace(/&quot;/g, '"').replace(/&apos;/g, "'")
+    .replace(/&lt;/g, "<")
+    .replace(/&gt;/g, ">")
+    .replace(/&quot;/g, '"')
+    .replace(/&apos;/g, "'")
     .replace(/&amp;/g, "&");
 }
 
-/**
- * 把 config.xml 第一个 BranchSpec 改为 newBranch，返回更新后的 xml 与改动前的裸分支名。
- * replace 第二参数必须用函数——字符串形式会把分支名里的 $$/$&/$`/$' 当替换模式解释，静默篡改 config。
- */
 export function setBranchInConfigXml(
   xml: string,
   newBranch: string
 ): { updated: string; oldBranch: string } {
-  const m = /(<hudson\.plugins\.git\.BranchSpec>\s*<name>)([^<]*)(<\/name>)/.exec(xml);
-  if (!m) throw new Error("config.xml 中未找到 BranchSpec，无法改分支");
-  const oldBranch = stripBranchPrefix(unescapeXml(m[2]));
-  const updated = xml.replace(m[0], () => `${m[1]}${escapeXml(newBranch)}${m[3]}`);
+  const match = /(<hudson\.plugins\.git\.BranchSpec>\s*<name>)([^<]*)(<\/name>)/.exec(xml);
+  if (!match) throw new Error("config.xml 中未找到 BranchSpec，无法改分支");
+  const oldBranch = stripBranchPrefix(unescapeXml(match[2]));
+  const updated = xml.replace(match[0], () => `${match[1]}${escapeXml(newBranch)}${match[3]}`);
   return { updated, oldBranch };
 }
 
-/** 从 config.xml 抠出 remote / 归一化键 / 裸分支名（listJenkinsJobs 与 getJobStatus 共用） */
 function parseJobConfig(xml: string): Pick<JobInfo, "remote" | "repo" | "branch" | "multiScm"> {
   const remote =
     xml.match(/<hudson\.plugins\.git\.UserRemoteConfig>[\s\S]*?<url>([^<]+)<\/url>/)?.[1] ?? "";
@@ -109,83 +83,18 @@ function parseJobConfig(xml: string): Pick<JobInfo, "remote" | "repo" | "branch"
   };
 }
 
-// ─── 写操作 ─────────────────────────────────────────────────────────────────
-
-/**
- * 把 Job 的第一个 BranchSpec 改为 newBranch（GET config.xml → 精确替换该节点 → POST 写回）。
- * 返回改动前的裸分支名。config 其余内容原样保留。
- */
-export async function updateJobBranch(name: string, newBranch: string): Promise<string> {
-  const xml = await jenkinsGet(`/job/${encodeURIComponent(name)}/config.xml`);
-  let result;
-  try {
-    result = setBranchInConfigXml(xml, newBranch);
-  } catch (e) {
-    throw new Error(`Job ${name} 的 ${(e as Error).message}`);
-  }
-  // charset=UTF-8 必带：Jenkins 2.470 对裸 application/xml 写回 config 返回 500（实测对照：
-  // 裸 xml→HOT/QAT 均 500；带 charset→均 200。降 XML 声明 1.1→1.0 不充分，QAT 仍 500，故不改内容只改 header）
-  await jenkinsPost(
-    `/job/${encodeURIComponent(name)}/config.xml`,
-    result.updated,
-    "application/xml;charset=UTF-8"
-  );
-  // 同步 jobCache，否则同进程内 find_job 会继续报旧分支
-  const cached = jobCache?.find((j) => j.name === name);
-  if (cached) cached.branch = newBranch;
-  return result.oldBranch;
-}
-
-/** 触发构建；尽力从 queue 拿到构建号（排队未起或轮询失败返回 null，附 Job 链接足够人工跟进） */
-export async function triggerBuild(name: string): Promise<number | null> {
-  const res = await jenkinsPost(`/job/${encodeURIComponent(name)}/build`);
-  // 取构建号是尽力而为：任何解析/轮询失败都不该让已成功触发的构建被误报为失败
-  try {
-    const queueUrl = res.headers.get("location"); // http://.../queue/item/123/
-    if (!queueUrl) return null;
-    const base = requireEnv("JENKINS_URL");
-    // JENKINS_URL 带 context path（如 /jenkins）时，Location 的 pathname 已含前缀，需减除防止重复拼接
-    const basePath = new URL(base).pathname.replace(/\/$/, "");
-    let itemPath = new URL(queueUrl, base + "/").pathname;
-    if (basePath && itemPath.startsWith(basePath)) itemPath = itemPath.slice(basePath.length);
-    // 15s 总窗口须盖住 quiet period + 执行器排队（真机实测约 10.5s）；使用绝对 deadline，
-    // 避免 15 次请求各自再等待 15s，令 MCP 调用在慢 Jenkins 上远超预期。
-    const deadline = Date.now() + 15_000;
-    while (Date.now() < deadline) {
-      await new Promise((r) => setTimeout(r, Math.min(1000, deadline - Date.now())));
-      const remaining = deadline - Date.now();
-      if (remaining <= 0) break;
-      const item = JSON.parse(await jenkinsGet(`${itemPath}api/json`, remaining)) as {
-        executable?: { number: number };
-      };
-      if (item.executable) return item.executable.number;
-    }
-  } catch {
-    // queue item 已被清理 / URL 解析失败等，放弃取号
-  }
-  return null;
-}
-
-// ─── 读操作 ─────────────────────────────────────────────────────────────────
-
-export interface LastBuild {
-  number: number;
-  result: string; // SUCCESS / FAILURE / ABORTED / BUILDING…
-  timestamp: number;
-  url: string;
-  trigger?: BuildTrigger;
-}
+// ─── build model and parsers ────────────────────────────────────────────────
 
 export type BuildTrigger =
   | { kind: "user"; label: string }
   | { kind: "cause"; label: string };
 
 interface BuildCause {
+  userId?: string;
   userName?: string;
   shortDescription?: string;
 }
 
-/** 人工触发优先返回用户名；否则保留 Jenkins 的完整 cause 描述，展示层不再二次包装。 */
 export function parseBuildTrigger(causes: BuildCause[]): BuildTrigger | undefined {
   const userName = causes.find((cause) => cause.userName)?.userName;
   if (userName) return { kind: "user", label: userName };
@@ -193,83 +102,322 @@ export function parseBuildTrigger(causes: BuildCause[]): BuildTrigger | undefine
   return description ? { kind: "cause", label: description } : undefined;
 }
 
+export interface GitRevisionInfo {
+  sha: string;
+  branches: string[];
+  remoteUrls: string[];
+  scmName?: string;
+}
+
+export interface JenkinsBuildInfo {
+  number: number;
+  result: string;
+  building: boolean;
+  startedAt: number;
+  duration: number;
+  completedAt: number;
+  url: string;
+  trigger?: BuildTrigger;
+  revision?: GitRevisionInfo;
+}
+
+interface RawBuildAction {
+  _class?: string;
+  causes?: BuildCause[];
+  lastBuiltRevision?: {
+    SHA1?: string;
+    branch?: { name?: string; SHA1?: string }[];
+  };
+  remoteUrls?: string[];
+  scmName?: string;
+}
+
+interface RawBuild {
+  number: number;
+  result: string | null;
+  timestamp: number;
+  duration?: number;
+  url: string;
+  building: boolean;
+  actions?: RawBuildAction[];
+}
+
+/** Select the Git Plugin BuildData action for the Job repository. */
+export function parseBuildRevision(
+  actions: RawBuildAction[],
+  jobRepo: string | null
+): GitRevisionInfo | undefined {
+  if (!jobRepo) return undefined;
+  const matches = actions.filter((action) => {
+    if (!action.lastBuiltRevision?.SHA1) return false;
+    return (action.remoteUrls ?? []).some((url) => normalizeRepo(url) === jobRepo);
+  });
+  if (matches.length !== 1) return undefined;
+
+  const action = matches[0];
+  const branches = [
+    ...new Set(
+      (action.lastBuiltRevision?.branch ?? [])
+        .map((branch) => stripBranchPrefix(branch.name ?? ""))
+        .filter(Boolean)
+    ),
+  ];
+  return {
+    sha: action.lastBuiltRevision!.SHA1!,
+    branches,
+    remoteUrls: [...new Set(action.remoteUrls ?? [])],
+    scmName: action.scmName || undefined,
+  };
+}
+
+function parseBuild(raw: RawBuild, jobRepo: string | null): JenkinsBuildInfo {
+  const duration = raw.duration ?? 0;
+  const causes = (raw.actions ?? []).flatMap((action) => action.causes ?? []);
+  return {
+    number: raw.number,
+    result: raw.building ? "BUILDING" : (raw.result ?? "?"),
+    building: raw.building,
+    startedAt: raw.timestamp,
+    duration,
+    completedAt: raw.timestamp + duration,
+    url: raw.url,
+    trigger: parseBuildTrigger(causes),
+    revision: parseBuildRevision(raw.actions ?? [], jobRepo),
+  };
+}
+
+export function getUniqueRevisionBranch(revision?: GitRevisionInfo): string | null {
+  return revision?.branches.length === 1 ? revision.branches[0] : null;
+}
+
+export interface JobActivity {
+  inQueue: boolean;
+  queueId?: number;
+  queueReason?: string;
+  lastBuild: JenkinsBuildInfo | null;
+}
+
 export interface JobStatus extends JobInfo {
-  lastBuild: LastBuild | null; // null = 从未构建（仅 404 时）
-  lastBuildError?: string; // 非 404 的查询失败，不能与「从未构建」混淆
-  deployUrls: string[]; // Job 描述里的 URL（部署页线索；README 约定拼路径太脆，不做）
+  configuredBranch: string;
+  lastBuild: JenkinsBuildInfo | null;
+  activityError?: string;
+  deployedBuild: JenkinsBuildInfo | null;
+  deployedBuildError?: string;
+  inQueue: boolean;
+  queueId?: number;
+  queueReason?: string;
+  deployUrls: string[];
 }
 
-/** 单个 Job 的当前配置 + 最近一次构建（Job 不存在时抛错） */
-export async function getJobStatus(name: string): Promise<JobStatus> {
-  const xml = await jenkinsGet(`/job/${encodeURIComponent(name)}/config.xml`);
-  // description 在 config.xml 里是 XML 转义的，先还原实体再抽 URL，否则 ?a=1&b=2 会在 &amp; 处截断
-  const desc = unescapeXml(xml.match(/<description>([\s\S]*?)<\/description>/)?.[1] ?? "");
-  const deployUrls = [...new Set(desc.match(/https?:\/\/[^\s<>"']+/g) ?? [])];
-  let lastBuild: LastBuild | null = null;
-  let lastBuildError: string | undefined;
-  try {
-    const b = JSON.parse(
-      await jenkinsGet(
-        `/job/${encodeURIComponent(name)}/lastBuild/api/json?tree=number,result,timestamp,url,building,actions[causes[userName,shortDescription]]`
-      )
-    ) as {
-      number: number;
-      result: string | null;
-      timestamp: number;
-      url: string;
-      building: boolean;
-      actions?: { causes?: BuildCause[] }[];
-    };
-    // tree 是白名单：不显式要 causes 字段 Jenkins 就不返回（此前「查不到部署人」的根因）
-    const causes = (b.actions ?? []).flatMap((a) => a?.causes ?? []);
-    lastBuild = {
-      number: b.number,
-      result: b.building ? "BUILDING" : (b.result ?? "?"),
-      timestamp: b.timestamp,
-      url: b.url,
-      trigger: parseBuildTrigger(causes),
-    };
-  } catch (e) {
-    // 仅 404 = 从未构建；5xx/超时等是查询失败，混淆两者会误导「Job 近期是否被占用」的判断
-    if (!/返回 404$/.test((e as Error).message)) {
-      lastBuildError = (e as Error).message;
-    }
-  }
-  return { name, ...parseJobConfig(xml), lastBuild, lastBuildError, deployUrls };
-}
+const BUILD_TREE =
+  "number,result,timestamp,duration,url,building,actions[_class,causes[userId,userName,shortDescription],lastBuiltRevision[SHA1,branch[name,SHA1]],remoteUrls,scmName]";
 
-/**
- * 接口：
- * 1) GET /api/json?tree=jobs[name,_class]  → 全量 Job 名 + 类型（识别 folder）
- * 2) GET /job/{name}/config.xml            → 解析 git remote + BranchSpec
- */
-export async function listJenkinsJobs(): Promise<JobInfo[]> {
-  if (jobCache) return jobCache;
+// ─── injectable client ──────────────────────────────────────────────────────
 
-  const { jobs } = JSON.parse(await jenkinsGet("/api/json?tree=jobs[name,_class]")) as {
-    jobs: { name: string; _class?: string }[];
+export function createJenkinsClient(options: JenkinsClientOptions = {}) {
+  const fetchImpl = options.fetchImpl ?? globalThis.fetch.bind(globalThis);
+  let jobCache: JobInfo[] | null = null;
+
+  const connection = () => ({
+    baseUrl: (options.baseUrl ?? requireEnv("JENKINS_URL")).replace(/\/+$/, ""),
+    user: options.user ?? requireEnv("JENKINS_USER"),
+    token: options.token ?? requireEnv("JENKINS_TOKEN"),
+  });
+
+  const jenkinsGet = async (path: string, timeoutMs = FETCH_TIMEOUT_MS): Promise<string> => {
+    const { baseUrl, user, token } = connection();
+    const response = await fetchImpl(baseUrl + path, {
+      headers: { Authorization: authHeader(user, token) },
+      signal: AbortSignal.timeout(timeoutMs),
+    });
+    if (!response.ok) throw new JenkinsHttpError(path, response.status);
+    return response.text();
   };
 
-  const out: JobInfo[] = [];
-  for (let i = 0; i < jobs.length; i += 10) {
-    await Promise.all(
-      jobs.slice(i, i + 10).map(async ({ name, _class }) => {
-        // folder 内的子 Job 当前接口拿不到，标记出来交给 audit 大声提示，不静默缺失
-        if (_class && /folder/i.test(_class)) {
-          out.push({ name, remote: "", repo: null, branch: "", folder: true });
-          return;
-        }
-        try {
-          const xml = await jenkinsGet(`/job/${encodeURIComponent(name)}/config.xml`);
-          out.push({ name, ...parseJobConfig(xml) });
-        } catch {
-          // 无权限 / 读失败也入列（remote 空），audit 可见，不静默丢
-          out.push({ name, remote: "", repo: null, branch: "" });
-        }
-      })
-    );
-  }
+  const jenkinsPost = async (path: string, body?: string, contentType?: string): Promise<Response> => {
+    const { baseUrl, user, token } = connection();
+    const headers: Record<string, string> = { Authorization: authHeader(user, token) };
+    if (contentType) headers["Content-Type"] = contentType;
+    const signal = () => AbortSignal.timeout(FETCH_TIMEOUT_MS);
+    let response = await fetchImpl(baseUrl + path, { method: "POST", headers, body, signal: signal() });
+    if (response.status === 403) {
+      const crumbResponse = await fetchImpl(baseUrl + "/crumbIssuer/api/json", {
+        headers: { Authorization: authHeader(user, token) },
+        signal: signal(),
+      });
+      if (crumbResponse.ok) {
+        const { crumb, crumbRequestField } = (await crumbResponse.json()) as {
+          crumb: string;
+          crumbRequestField: string;
+        };
+        const cookie = crumbResponse.headers
+          .getSetCookie()
+          .map((value) => value.split(";")[0])
+          .find((value) => /session/i.test(value));
+        const retryHeaders = { ...headers, [crumbRequestField]: crumb };
+        if (cookie) retryHeaders.Cookie = cookie;
+        response = await fetchImpl(baseUrl + path, {
+          method: "POST",
+          headers: retryHeaders,
+          body,
+          signal: signal(),
+        });
+      }
+    }
+    if (!response.ok) throw new JenkinsHttpError(`POST ${path}`, response.status);
+    return response;
+  };
 
-  jobCache = out;
-  return out;
+  const updateJobBranch = async (name: string, newBranch: string): Promise<string> => {
+    const xml = await jenkinsGet(`/job/${encodeURIComponent(name)}/config.xml`);
+    let result;
+    try {
+      result = setBranchInConfigXml(xml, newBranch);
+    } catch (error) {
+      throw new Error(`Job ${name} 的 ${(error as Error).message}`);
+    }
+    await jenkinsPost(
+      `/job/${encodeURIComponent(name)}/config.xml`,
+      result.updated,
+      "application/xml;charset=UTF-8"
+    );
+    const cached = jobCache?.find((job) => job.name === name);
+    if (cached) cached.branch = newBranch;
+    return result.oldBranch;
+  };
+
+  const triggerBuild = async (name: string): Promise<number | null> => {
+    const response = await jenkinsPost(`/job/${encodeURIComponent(name)}/build`);
+    try {
+      const queueUrl = response.headers.get("location");
+      if (!queueUrl) return null;
+      const { baseUrl } = connection();
+      const basePath = new URL(baseUrl).pathname.replace(/\/$/, "");
+      let itemPath = new URL(queueUrl, baseUrl + "/").pathname;
+      if (basePath && itemPath.startsWith(basePath)) itemPath = itemPath.slice(basePath.length);
+      const deadline = Date.now() + 15_000;
+      while (Date.now() < deadline) {
+        await new Promise((resolve) => setTimeout(resolve, Math.min(1000, deadline - Date.now())));
+        const remaining = deadline - Date.now();
+        if (remaining <= 0) break;
+        const item = JSON.parse(await jenkinsGet(`${itemPath}api/json`, remaining)) as {
+          executable?: { number: number };
+        };
+        if (item.executable) return item.executable.number;
+      }
+    } catch {
+      // The build was triggered successfully; queue-number lookup is best effort.
+    }
+    return null;
+  };
+
+  const getJobActivity = async (name: string, jobRepo: string | null): Promise<JobActivity> => {
+    const raw = JSON.parse(
+      await jenkinsGet(
+        `/job/${encodeURIComponent(name)}/api/json?tree=inQueue,queueItem[id,why],lastBuild[${BUILD_TREE}]`
+      )
+    ) as {
+      inQueue?: boolean;
+      queueItem?: { id?: number; why?: string } | null;
+      lastBuild?: RawBuild | null;
+    };
+    return {
+      inQueue: raw.inQueue === true,
+      queueId: raw.queueItem?.id,
+      queueReason: raw.queueItem?.why || undefined,
+      lastBuild: raw.lastBuild ? parseBuild(raw.lastBuild, jobRepo) : null,
+    };
+  };
+
+  const getJobStatus = async (name: string): Promise<JobStatus> => {
+    const xml = await jenkinsGet(`/job/${encodeURIComponent(name)}/config.xml`);
+    const config = parseJobConfig(xml);
+    const description = unescapeXml(xml.match(/<description>([\s\S]*?)<\/description>/)?.[1] ?? "");
+    const deployUrls = [...new Set(description.match(/https?:\/\/[^\s<>"']+/g) ?? [])];
+
+    let activity: JobActivity = { inQueue: false, lastBuild: null };
+    let activityError: string | undefined;
+    try {
+      activity = await getJobActivity(name, config.repo);
+    } catch (error) {
+      activityError = (error as Error).message;
+    }
+
+    let deployedBuild: JenkinsBuildInfo | null = null;
+    let deployedBuildError: string | undefined;
+    try {
+      const raw = JSON.parse(
+        await jenkinsGet(`/job/${encodeURIComponent(name)}/lastStableBuild/api/json?tree=${BUILD_TREE}`)
+      ) as RawBuild;
+      if (raw.result !== "SUCCESS" || raw.building) {
+        deployedBuildError = `lastStableBuild 返回 ${raw.building ? "BUILDING" : (raw.result ?? "空状态")}，不是严格 SUCCESS`;
+      } else {
+        deployedBuild = parseBuild(raw, config.repo);
+      }
+    } catch (error) {
+      if (!(error instanceof JenkinsHttpError && error.status === 404)) {
+        deployedBuildError = (error as Error).message;
+      }
+    }
+
+    return {
+      name,
+      ...config,
+      configuredBranch: config.branch,
+      lastBuild: activity.lastBuild,
+      activityError,
+      deployedBuild,
+      deployedBuildError,
+      inQueue: activity.inQueue,
+      queueId: activity.queueId,
+      queueReason: activity.queueReason,
+      deployUrls,
+    };
+  };
+
+  const listJenkinsJobs = async (): Promise<JobInfo[]> => {
+    if (jobCache) return jobCache;
+    const { jobs } = JSON.parse(await jenkinsGet("/api/json?tree=jobs[name,_class]")) as {
+      jobs: { name: string; _class?: string }[];
+    };
+    const output: JobInfo[] = [];
+    for (let index = 0; index < jobs.length; index += 10) {
+      await Promise.all(
+        jobs.slice(index, index + 10).map(async ({ name, _class }) => {
+          if (_class && /folder/i.test(_class)) {
+            output.push({ name, remote: "", repo: null, branch: "", folder: true });
+            return;
+          }
+          try {
+            const xml = await jenkinsGet(`/job/${encodeURIComponent(name)}/config.xml`);
+            output.push({ name, ...parseJobConfig(xml) });
+          } catch {
+            output.push({ name, remote: "", repo: null, branch: "" });
+          }
+        })
+      );
+    }
+    jobCache = output;
+    return output;
+  };
+
+  return {
+    jenkinsGet,
+    updateJobBranch,
+    triggerBuild,
+    getJobActivity,
+    getJobStatus,
+    listJenkinsJobs,
+  };
 }
+
+export type JenkinsClient = ReturnType<typeof createJenkinsClient>;
+
+const defaultClient = createJenkinsClient();
+
+export const jenkinsGet = defaultClient.jenkinsGet;
+export const updateJobBranch = defaultClient.updateJobBranch;
+export const triggerBuild = defaultClient.triggerBuild;
+export const getJobActivity = defaultClient.getJobActivity;
+export const getJobStatus = defaultClient.getJobStatus;
+export const listJenkinsJobs = defaultClient.listJenkinsJobs;

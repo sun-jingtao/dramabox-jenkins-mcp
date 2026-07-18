@@ -1,14 +1,29 @@
-// ─── MCP 工具的注册与编排（find_job / get_status / deploy / list_history / rollback）─
-// 排版约定：注册（工具目录）在最上，往下依次是各工具的编排函数、格式化等细节。
+// MCP tools and orchestration (find_job / get_status / deploy).
 
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
-import { randomUUID } from "node:crypto";
 import { z } from "zod";
 
 import { requireEnv } from "./env.js";
-import { getJobStatus, listJenkinsJobs, triggerBuild, updateJobBranch } from "./jenkins.js";
-import { branchExists, getMergeStatus, getProjectByPath, searchGitlabProjects, type MergeStatus } from "./gitlab.js";
-import { appendDeployLog, readDeployLog } from "./history.js";
+import {
+  branchExists,
+  getCommitMergeStatus,
+  getProjectByPath,
+  searchGitlabProjects,
+  type MergeStatus,
+  type ProjectRef,
+} from "./gitlab.js";
+import {
+  getJobActivity,
+  getJobStatus,
+  getUniqueRevisionBranch,
+  listJenkinsJobs,
+  stripBranchPrefix,
+  triggerBuild,
+  updateJobBranch,
+  type JenkinsBuildInfo,
+  type JobActivity,
+  type JobStatus,
+} from "./jenkins.js";
 import {
   DEPLOYMENT_ENVS,
   auditWarnings,
@@ -16,15 +31,79 @@ import {
   matchJobs,
   type DeploymentEnv,
   type GitlabProject,
+  type JobInfo,
 } from "./match.js";
 
-/** Job 仓库 host 别名是否与当前连接的 GITLAB_URL 同属一个实例。
- *  不同实例下同名 path 会指向错误项目，防覆盖须按「无法确认」拦截，绝不跨实例查询后放行。 */
-function sameGitlabInstance(repo: string): boolean {
-  return repo.split(":")[0] === gitlabInstanceAlias(requireEnv("GITLAB_URL"));
+export interface ToolDependencies {
+  listJenkinsJobs: () => Promise<JobInfo[]>;
+  getJobStatus: (name: string) => Promise<JobStatus>;
+  getJobActivity: (name: string, jobRepo: string | null) => Promise<JobActivity>;
+  updateJobBranch: (name: string, branch: string) => Promise<string>;
+  triggerBuild: (name: string) => Promise<number | null>;
+  searchGitlabProjects: (keyword: string) => Promise<GitlabProject[]>;
+  getProjectByPath: (path: string) => Promise<ProjectRef | null>;
+  branchExists: (project: ProjectRef, branch: string) => Promise<boolean>;
+  getCommitMergeStatus: (
+    project: ProjectRef,
+    deployedSha: string,
+    deployedBranch?: string | null
+  ) => Promise<MergeStatus>;
+  gitlabUrl: () => string;
+  jenkinsUrl: () => string;
 }
 
-// ─── 注册：全部 MCP 工具的目录 ───────────────────────────────────────────────
+const defaultDependencies: ToolDependencies = {
+  listJenkinsJobs,
+  getJobStatus,
+  getJobActivity,
+  updateJobBranch,
+  triggerBuild,
+  searchGitlabProjects,
+  getProjectByPath,
+  branchExists,
+  getCommitMergeStatus,
+  gitlabUrl: () => requireEnv("GITLAB_URL"),
+  jenkinsUrl: () => requireEnv("JENKINS_URL"),
+};
+
+function sameGitlabInstance(repo: string, deps: ToolDependencies): boolean {
+  return repo.split(":")[0] === gitlabInstanceAlias(deps.gitlabUrl());
+}
+
+function buildTriggerText(build: JenkinsBuildInfo): string {
+  if (!build.trigger) return "";
+  return build.trigger.kind === "user"
+    ? `，由 ${build.trigger.label} 触发`
+    : `，${build.trigger.label}`;
+}
+
+function buildRevisionText(build: JenkinsBuildInfo): string {
+  if (!build.revision) return "Git revision 无法确定";
+  const branch = getUniqueRevisionBranch(build.revision);
+  const branchText = branch ?? (build.revision.branches.length > 0
+    ? `[${build.revision.branches.join(", ")}]`
+    : "未知分支");
+  return `${branchText}@${build.revision.sha.slice(0, 8)}`;
+}
+
+function concurrencyBlock(activity: Pick<JobStatus, "inQueue" | "queueId" | "queueReason" | "lastBuild">): string | null {
+  if (activity.lastBuild?.building) {
+    return [
+      `🛑 已中止部署：Jenkins #${activity.lastBuild.number} 正在构建，不能通过 force 绕过。`,
+      activity.lastBuild.url,
+      "请等待构建完成，或确认后到 Jenkins UI abort。",
+    ].join("\n");
+  }
+  if (activity.inQueue) {
+    const queue = activity.queueId !== undefined ? ` #${activity.queueId}` : "";
+    const reason = activity.queueReason ? `：${activity.queueReason}` : "";
+    return [
+      `🛑 已中止部署：Job 已在 Jenkins queue${queue}${reason}，不能通过 force 绕过。`,
+      "请等待任务离开队列，或确认后到 Jenkins UI cancel。",
+    ].join("\n");
+  }
+  return null;
+}
 
 export function registerTools(server: McpServer): void {
   server.registerTool(
@@ -32,7 +111,7 @@ export function registerTools(server: McpServer): void {
     {
       title: "定位 Jenkins Job",
       description:
-        "按 GitLab 仓库定位 Jenkins HOT/QAT/QAT2 候选 Job，返回 Job 名、当前分支、仓库地址和链接。多环境时返回列表供确认。",
+        "按 GitLab 仓库定位 Jenkins HOT/QAT/QAT2 候选 Job，返回 Job 名、Jenkins 当前配置分支、仓库地址和链接。",
       inputSchema: {
         repo: z.string().describe("GitLab 仓库名或关键词，如 dramabox_other"),
         env: z.enum(DEPLOYMENT_ENVS).optional().describe("环境过滤：hot / qat / qat2；不传则返回全部候选"),
@@ -49,9 +128,9 @@ export function registerTools(server: McpServer): void {
     {
       title: "查看 Job 部署状态",
       description:
-        "查看 Jenkins Job 的当前部署分支、最近构建结果、分支相对主干的合并状态，以及 Job 描述里可知的部署页线索（deploy 防覆盖检查的依据）。",
+        "查看 Jenkins 当前配置、最近构建尝试、最近一次严格成功部署及其相对主干的合并状态。",
       inputSchema: {
-        job: z.string().describe("Jenkins Job 精确名称（可先用 find_job 定位），如 TEST-hot-dramabox-other"),
+        job: z.string().describe("Jenkins Job 精确名称（可先用 find_job 定位）"),
       },
       annotations: { readOnlyHint: true },
     },
@@ -65,305 +144,282 @@ export function registerTools(server: McpServer): void {
     {
       title: "部署分支到 Job",
       description:
-        "把 Jenkins Job 的部署分支改为指定分支并触发构建。内置防覆盖检查：当前分支未合并进主干（或无法确认）时会中止并告警，此时必须先向用户复述告警内容并获得明确同意，才能带 force=true 重试。",
+        "修改 BranchSpec 并触发构建。并发构建会硬拦截；同一实际部署分支可直接重部署，切换分支时基于最近成功部署 SHA 防覆盖。",
       inputSchema: {
         job: z.string().describe("Jenkins Job 精确名称（可先用 find_job 定位）"),
         branch: z.string().describe("要部署的目标分支名"),
         force: z
           .boolean()
           .optional()
-          .describe("覆盖确认：仅在用户明确同意覆盖未合并/无法确认的分支后才传 true"),
+          .describe("仅在用户明确同意覆盖未合并或无法确认的成功部署版本后传 true"),
       },
     },
     async ({ job, branch, force }) => ({
       content: [{ type: "text" as const, text: await runDeploy(job, branch, force) }],
     })
   );
-
-  server.registerTool(
-    "list_history",
-    {
-      title: "查看部署记录",
-      description: "查看本工具执行过的分支切换与构建记录（最新在前）。",
-      inputSchema: {
-        job: z.string().optional().describe("Jenkins Job 名；不传则返回全部 Job 的记录"),
-      },
-      annotations: { readOnlyHint: true },
-    },
-    async ({ job }) => ({
-      content: [{ type: "text" as const, text: runListHistory(job) }],
-    })
-  );
-
-  server.registerTool(
-    "rollback",
-    {
-      title: "回滚到上一个分支",
-      description:
-        "把 Job 切回部署记录中最近一次分支变更前的分支并构建。内部走 deploy 同一套防覆盖检查，被拦截时同样需向用户确认后带 force=true。",
-      inputSchema: {
-        job: z.string().describe("Jenkins Job 精确名称"),
-        force: z
-          .boolean()
-          .optional()
-          .describe("覆盖确认：仅在用户明确同意覆盖未合并/无法确认的分支后才传 true"),
-      },
-    },
-    async ({ job, force }) => ({
-      content: [{ type: "text" as const, text: await runRollback(job, force) }],
-    })
-  );
 }
 
-// ─── find_job ────────────────────────────────────────────────────────────────
-
-/** 按仓库关键词定位候选 Job：GitLab 搜项目 → 归一化键全等匹配 Jenkins Job → env 过滤，附 audit 告警 */
-export async function runFindJob(repo: string, envFilter?: DeploymentEnv): Promise<string> {
-  const jobs = await listJenkinsJobs();
+export async function runFindJob(
+  repo: string,
+  envFilter?: DeploymentEnv,
+  deps: ToolDependencies = defaultDependencies
+): Promise<string> {
+  const jobs = await deps.listJenkinsJobs();
   let projects: GitlabProject[];
   try {
-    projects = await searchGitlabProjects(repo);
-  } catch (e) {
-    // 失败必须显式报出，绝不静默降级为模糊匹配（下游是 deploy，错配代价高于中止）
-    return `GitLab 查询失败：${(e as Error).message}。为避免误匹配已中止，请检查 GITLAB_URL / GITLAB_TOKEN 后重试。`;
+    projects = await deps.searchGitlabProjects(repo);
+  } catch (error) {
+    return `GitLab 查询失败：${(error as Error).message}。为避免误匹配已中止，请检查配置后重试。`;
   }
   const hits = matchJobs(jobs, projects, repo, envFilter);
-  // search 单页上限 100：打满意味着召回可能被截断，目标项目或已漏掉
-  const truncateWarn =
-    projects.length >= 100 ? "\n\n⚠️ GitLab 搜索命中已达单页上限 100，召回可能被截断；若目标缺席请用更精确的仓库名重试。" : "";
-
+  const truncateWarning = projects.length >= 100
+    ? "\n\n⚠️ GitLab 搜索命中已达单页上限 100，召回可能被截断；请用更精确的仓库名重试。"
+    : "";
   if (hits.length === 0) {
-    const gitlabHint = projects.map((p) => p.path).join("、") || "无";
+    const gitlabHint = projects.map((project) => project.path).join("、") || "无";
     return (
       `未找到匹配 Job（repo=${repo}${envFilter ? `, env=${envFilter}` : ""}）。GitLab 命中项目：${gitlabHint}` +
-      truncateWarn +
+      truncateWarning +
       auditWarnings(jobs)
     );
   }
 
-  const base = requireEnv("JENKINS_URL");
-  const list = [
+  const base = deps.jenkinsUrl();
+  return [
     `找到 ${hits.length} 个候选 Job：`,
     ...hits.map(
-      (j) =>
-        `- ${j.name}\n  当前分支: ${j.branch}\n  仓库: ${j.remote}\n  Job 链接: ${base}/job/${encodeURIComponent(j.name)}/`
+      (job) =>
+        `- ${job.name}\n  Jenkins 当前配置分支: ${job.branch}\n  仓库: ${job.remote}\n  Job 链接: ${base}/job/${encodeURIComponent(job.name)}/`
     ),
-  ].join("\n");
-  return list + truncateWarn + auditWarnings(jobs);
+  ].join("\n") + truncateWarning + auditWarnings(jobs);
 }
 
-// ─── get_status ──────────────────────────────────────────────────────────────
-
-/** 查看 Job 当前分支、最近构建、合并状态，及 Job 描述里的部署页线索（防覆盖判断依据） */
-export async function runGetStatus(job: string): Promise<string> {
-  let status;
+export async function runGetStatus(
+  job: string,
+  deps: ToolDependencies = defaultDependencies
+): Promise<string> {
+  let status: JobStatus;
   try {
-    status = await getJobStatus(job);
-  } catch (e) {
-    return `读取 Job 失败：${(e as Error).message}。请确认 Job 名称精确无误（可先用 find_job 定位）。`;
+    status = await deps.getJobStatus(job);
+  } catch (error) {
+    return `读取 Job 失败：${(error as Error).message}。请确认 Job 名称精确无误（可先用 find_job 定位）。`;
   }
 
-  const lines = [`Job: ${job}`, `当前部署分支: ${status.branch || "(未配置)"}`];
+  const lines = [
+    `Job: ${job}`,
+    `Jenkins 当前配置分支: ${status.configuredBranch || "(未配置)"}`,
+  ];
+  if (status.inQueue) {
+    lines.push(
+      `队列状态: IN_QUEUE${status.queueId !== undefined ? ` #${status.queueId}` : ""}${status.queueReason ? ` —— ${status.queueReason}` : ""}`
+    );
+  }
 
-  const triggerText = status.lastBuild?.trigger
-    ? status.lastBuild.trigger.kind === "user"
-      ? ` 由 ${status.lastBuild.trigger.label} 触发`
-      : ` ${status.lastBuild.trigger.label}`
-    : "";
+  if (status.activityError) {
+    lines.push(`最近构建尝试: ⚠️ 查询失败 —— ${status.activityError}`);
+  } else if (status.lastBuild) {
+    lines.push(
+      [
+        `最近构建尝试: #${status.lastBuild.number} ${status.lastBuild.result}`,
+        `  ${buildRevisionText(status.lastBuild)}`,
+        `  开始时间: ${new Date(status.lastBuild.startedAt).toLocaleString("zh-CN")}${buildTriggerText(status.lastBuild)}`,
+        `  ${status.lastBuild.url}`,
+      ].join("\n")
+    );
+  } else {
+    lines.push("最近构建尝试: 从未构建");
+  }
 
-  lines.push(
-    status.lastBuild
-      ? `最近构建: #${status.lastBuild.number} ${status.lastBuild.result} (${new Date(status.lastBuild.timestamp).toLocaleString("zh-CN")})${triggerText}\n  ${status.lastBuild.url}`
-      : status.lastBuildError
-        ? `最近构建: ⚠️ 查询失败（${status.lastBuildError}），非「从未构建」`
-        : "最近构建: 从未构建"
-  );
+  if (status.deployedBuildError) {
+    lines.push(`最近一次成功部署: ⚠️ 查询失败 —— ${status.deployedBuildError}`);
+  } else if (status.deployedBuild) {
+    lines.push(
+      [
+        `最近一次成功部署: #${status.deployedBuild.number} SUCCESS`,
+        `  ${buildRevisionText(status.deployedBuild)}`,
+        `  完成时间: ${new Date(status.deployedBuild.completedAt).toLocaleString("zh-CN")}${buildTriggerText(status.deployedBuild)}`,
+        `  ${status.deployedBuild.url}`,
+      ].join("\n")
+    );
+  } else {
+    lines.push(
+      "最近一次成功部署: ⚠️ 无法确认。可能是新 Job 首次部署、构建历史已轮转，或 Jenkins 没有严格 SUCCESS 记录。"
+    );
+  }
+
   if (status.deployUrls.length > 0) {
     lines.push(`部署页线索（来自 Job 描述）: ${status.deployUrls.join("  ")}`);
   }
-
   if (!status.repo) {
-    lines.push("仓库: 未解析出 Git 仓库（无静态 SCM），无法判断合并状态");
+    lines.push("仓库: 未解析出静态 Git 仓库，无法判断成功部署版本的合并状态");
     return lines.join("\n");
   }
-  const repoPath = status.repo.split(":")[1];
   lines.push(`仓库: ${status.remote}`);
-
-  // 跨实例守卫：Job 仓库与当前 GITLAB_URL 非同一实例时，同名 path 会指向错误项目，不跨实例查询
-  if (!sameGitlabInstance(status.repo)) {
+  const revision = status.deployedBuild?.revision;
+  if (!revision) {
+    lines.push("成功部署版本合并状态: ⚠️ 无法确认 —— lastStableBuild 缺少匹配当前仓库的 Git BuildData");
+    return lines.join("\n");
+  }
+  if (!sameGitlabInstance(status.repo, deps)) {
     lines.push(
-      `合并状态: ⚠️ 无法确认 —— Job 仓库属于另一 GitLab 实例 ${status.repo.split(":")[0]}，当前连接 ${gitlabInstanceAlias(requireEnv("GITLAB_URL"))}，跨实例不查询以免同名 path 误判`
+      `成功部署版本合并状态: ⚠️ 无法确认 —— Job 仓库属于 ${status.repo.split(":")[0]}，当前连接 ${gitlabInstanceAlias(deps.gitlabUrl())}`
     );
     return lines.join("\n");
   }
 
-  // 合并状态：GitLab 查不到项目（另一实例/无权限）→ unknown，绝不猜测
+  const repoPath = status.repo.split(":")[1];
   try {
-    const project = await getProjectByPath(repoPath);
+    const project = await deps.getProjectByPath(repoPath);
     if (!project) {
-      lines.push(`合并状态: ⚠️ 无法确认 —— GitLab 上查不到 ${repoPath}（可能属于另一 GitLab 实例或当前 token 无权限）`);
+      lines.push(`成功部署版本合并状态: ⚠️ 无法确认 —— GitLab 上查不到 ${repoPath}`);
     } else {
-      const ms = await getMergeStatus(project, status.branch);
-      const icon = { merged: "✅ 已合并", not_merged: "❌ 未合并", unknown: "⚠️ 无法确认" }[ms.state];
-      lines.push(`合并状态: ${icon} —— ${ms.detail}`);
+      const merge = await deps.getCommitMergeStatus(
+        project,
+        revision.sha,
+        getUniqueRevisionBranch(revision)
+      );
+      const label = {
+        merged: "✅ 已进入主干",
+        not_merged: "❌ 尚未进入主干",
+        unknown: "⚠️ 无法确认",
+      }[merge.state];
+      lines.push(`成功部署版本合并状态: ${label} —— ${merge.detail}`);
     }
-  } catch (e) {
-    lines.push(`合并状态: ⚠️ 无法确认 —— GitLab 查询失败：${(e as Error).message}`);
+  } catch (error) {
+    lines.push(`成功部署版本合并状态: ⚠️ 无法确认 —— ${(error as Error).message}`);
   }
   return lines.join("\n");
 }
 
-// ─── deploy ──────────────────────────────────────────────────────────────────
-
-/** 防覆盖检查 → 改 BranchSpec → 触发构建 → 写操作日志（op 供 rollback 标记自身记录） */
 export async function runDeploy(
   job: string,
   branch: string,
   force = false,
-  op: "deploy" | "rollback" = "deploy"
+  deps: ToolDependencies = defaultDependencies
 ): Promise<string> {
-  let status;
-  try {
-    status = await getJobStatus(job);
-  } catch (e) {
-    return `读取 Job 失败：${(e as Error).message}。请确认 Job 名称精确无误（可先用 find_job 定位）。`;
-  }
-  const current = status.branch;
-  const repoPath = status.repo?.split(":")[1];
-  // 跨实例守卫：Job 仓库与当前 GITLAB_URL 非同一实例时，同名 path 会指向错误项目——
-  // 绝不跨实例查询后放行覆盖，直接按「无法确认」拦截（除非 force）
-  const crossInstance = !!status.repo && !sameGitlabInstance(status.repo);
-  const project =
-    repoPath && !crossInstance ? await getProjectByPath(repoPath).catch(() => null) : null;
+  const targetBranch = stripBranchPrefix(branch);
+  if (!targetBranch) return "🛑 已中止部署：目标分支名不能为空。";
 
-  // 防覆盖检查（PRD 第 4 节）：仅在换分支时需要；查不到项目一律按「无法确认」处理
-  if (current && current !== branch && !force) {
-    const ms: MergeStatus = project
-      ? await getMergeStatus(project, current).catch(
-          (e) => ({ state: "unknown", detail: `GitLab 查询失败：${(e as Error).message}` }) as MergeStatus
-        )
-      : {
-          state: "unknown",
-          detail: crossInstance
-            ? `Job 仓库属于另一 GitLab 实例 ${status.repo!.split(":")[0]}，当前连接 ${gitlabInstanceAlias(requireEnv("GITLAB_URL"))}，跨实例不查询以免同名 path 误判`
-            : `GitLab 上查不到 ${repoPath ?? "该仓库"}（另一实例或无权限）`,
-        };
-    if (ms.state !== "merged") {
+  let status: JobStatus;
+  try {
+    status = await deps.getJobStatus(job);
+  } catch (error) {
+    return `读取 Job 失败：${(error as Error).message}。请确认 Job 名称精确无误（可先用 find_job 定位）。`;
+  }
+  if (status.activityError) {
+    return `🛑 已中止部署：无法确认 Jenkins queue/BUILDING 状态（${status.activityError}），不能通过 force 绕过。`;
+  }
+  const activeBlock = concurrencyBlock(status);
+  if (activeBlock) return activeBlock;
+
+  const repoPath = status.repo?.split(":")[1];
+  const crossInstance = !!status.repo && !sameGitlabInstance(status.repo, deps);
+  let project: ProjectRef | null = null;
+  let projectError = "";
+  if (repoPath && !crossInstance) {
+    try {
+      project = await deps.getProjectByPath(repoPath);
+      if (!project) projectError = `GitLab 上查不到 ${repoPath}（不存在或当前 token 无权限）`;
+    } catch (error) {
+      projectError = `GitLab 项目查询失败：${(error as Error).message}`;
+    }
+  } else if (crossInstance) {
+    projectError = `Job 仓库属于另一 GitLab 实例 ${status.repo!.split(":")[0]}，当前连接 ${gitlabInstanceAlias(deps.gitlabUrl())}`;
+  } else {
+    projectError = "Job 未解析出静态 Git 仓库";
+  }
+
+  if (project) {
+    try {
+      if (!(await deps.branchExists(project, targetBranch))) {
+        return `🛑 已中止部署：GitLab 仓库 ${repoPath} 上不存在分支 ${targetBranch}，请检查分支名。`;
+      }
+    } catch (error) {
+      return `🛑 已中止部署：目标分支存在性查询失败（${(error as Error).message}），尚未修改 Jenkins 配置。`;
+    }
+  }
+
+  const revision = status.deployedBuild?.revision;
+  const deployedBranch = getUniqueRevisionBranch(revision);
+  const sameDeployedBranch = deployedBranch === targetBranch;
+  let protectionWarning = "";
+
+  if (!project && !force) {
+    return [
+      "🛑 已中止部署：GitLab 仓库状态无法确认。",
+      projectError,
+      "无法校验目标分支及防覆盖状态。请向用户复述以上信息并获得明确同意后，带 force=true 重试。",
+    ].join("\n");
+  }
+
+  if (!sameDeployedBranch && !force) {
+    let merge: MergeStatus;
+    if (!status.deployedBuild) {
+      const reason = status.deployedBuildError
+        ? `lastStableBuild 查询失败：${status.deployedBuildError}`
+        : "没有可用的 lastStableBuild（可能是新 Job 或构建历史已轮转）";
+      merge = { state: "unknown", detail: reason };
+    } else if (!revision) {
+      merge = { state: "unknown", detail: "lastStableBuild 缺少匹配当前仓库的 Git BuildData/SHA" };
+    } else if (!project) {
+      merge = { state: "unknown", detail: projectError };
+    } else {
+      merge = await deps
+        .getCommitMergeStatus(project, revision.sha, deployedBranch)
+        .catch((error) => ({
+          state: "unknown" as const,
+          detail: `GitLab 查询失败：${(error as Error).message}`,
+        }));
+    }
+    if (merge.state !== "merged") {
       return [
-        `🛑 已中止部署。当前分支 ${current} ${ms.state === "not_merged" ? "尚未合并进主干" : "合并状态无法确认"}：${ms.detail}`,
-        `覆盖它可能丢失他人未合并的改动。请向用户确认后，带 force=true 重新调用 deploy。`,
+        `🛑 已中止部署：最近成功部署版本${deployedBranch ? ` ${deployedBranch}` : ""}${revision ? `@${revision.sha.slice(0, 8)}` : ""} ${merge.state === "not_merged" ? "尚未进入主干" : "状态无法确认"}。`,
+        merge.detail,
+        "覆盖它可能丢失他人未合并的部署。请向用户复述以上信息并获得明确同意后，带 force=true 重试。",
       ].join("\n");
     }
+  } else if (!sameDeployedBranch && force && project) {
+    protectionWarning = "\n⚠️ 已按用户确认使用 force=true，跳过最近成功部署版本的主干合并保护。";
+  } else if (!project) {
+    protectionWarning = `\n⚠️ ${projectError}，本次 force 部署无法校验目标分支是否存在。`;
   }
 
-  // 目标分支存在性校验（查得到项目才校验，防打错字触发必败构建）
-  // 三态：false（404，分支确实不存在）→ 拦；null（网络/5xx 查询失败）→ 放行但显式 WARN，Jenkins 兜底
-  let branchCheckWarn = "";
-  if (project && branch !== current) {
-    const exists = await branchExists(project, branch).catch(() => null);
-    if (exists === false) {
-      return `🛑 已中止部署。GitLab 仓库 ${repoPath} 上不存在分支 ${branch}，请检查分支名。`;
-    }
-    if (exists === null) {
-      branchCheckWarn = `\n⚠️ 目标分支存在性查询失败（GitLab 暂不可达），本次未校验分支名；若分支名有误，构建将失败。`;
-    }
-  }
-
-  // 执行：改分支（同分支跳过）→ 先记账 → 触发构建并补记构建号
-  let from = current;
-  if (current !== branch) {
-    from = await updateJobBranch(job, branch);
-  }
-  // 分支已经改完，等待 queue 构建号前先持久化；进程即使在轮询期间退出，rollback 仍有依据。
-  const pendingRecord = {
-    id: randomUUID(),
-    time: new Date().toISOString(),
-    job,
-    from,
-    to: branch,
-    build: null,
-    op,
-  } as const;
+  // Narrow the race between protection checks and the config write.
+  let latestActivity: JobActivity;
   try {
-    appendDeployLog(pendingRecord);
-  } catch (e) {
-    const change = from === branch ? `分支仍为 ${branch}` : `分支已从 ${from} 改为 ${branch}`;
-    return [
-      `🛑 ${change}，但部署账本写入失败：${(e as Error).message}`,
-      "为避免产生无法自动回滚的构建，本次未触发构建。请修复账本权限或磁盘问题后重试。",
-    ].join("\n") + branchCheckWarn;
+    latestActivity = await deps.getJobActivity(job, status.repo);
+  } catch (error) {
+    return `🛑 已中止部署：写配置前无法再次确认 Jenkins queue/BUILDING 状态（${(error as Error).message}）。`;
   }
+  const secondActiveBlock = concurrencyBlock(latestActivity);
+  if (secondActiveBlock) return secondActiveBlock;
 
-  let build: number | null = null;
-  let buildError: string | null = null;
-  let logUpdateError: string | null = null;
+  let previousBranch = status.configuredBranch;
   try {
-    build = await triggerBuild(job);
-  } catch (e) {
-    buildError = (e as Error).message;
-  }
-  if (build !== null) {
-    try {
-      appendDeployLog({ ...pendingRecord, build });
-    } catch (e) {
-      // pending 记录已经存在，回滚依据未丢；只提示构建号未能补记。
-      logUpdateError = (e as Error).message;
+    if (status.configuredBranch !== targetBranch) {
+      previousBranch = await deps.updateJobBranch(job, targetBranch);
     }
+  } catch (error) {
+    return `🛑 Jenkins 配置修改失败：${(error as Error).message}`;
   }
 
-  const base = requireEnv("JENKINS_URL");
-  const jobUrl = `${base}/job/${encodeURIComponent(job)}/`;
-  if (buildError) {
+  let build: number | null;
+  try {
+    build = await deps.triggerBuild(job);
+  } catch (error) {
     return [
-      `⚠️ 分支已改为 ${branch}${from !== branch ? `（原 ${from}，已记账可回滚）` : ""}，但构建触发失败：${buildError}`,
-      `请到 Jenkins 手动构建或重试 deploy：${jobUrl}`,
-    ].join("\n") + branchCheckWarn;
+      `⚠️ Jenkins 配置分支已${previousBranch === targetBranch ? `保持为 ${targetBranch}` : `从 ${previousBranch} 改为 ${targetBranch}`}，但构建触发失败：${(error as Error).message}`,
+      `请到 Jenkins 检查并手动处理：${deps.jenkinsUrl()}/job/${encodeURIComponent(job)}/`,
+    ].join("\n") + protectionWarning;
   }
-  const result = [
-    `✅ 已部署 ${job}`,
-    `分支: ${from === branch ? `${branch}（未变更，直接重新构建）` : `${from} → ${branch}`}`,
-    build
+
+  const jobUrl = `${deps.jenkinsUrl()}/job/${encodeURIComponent(job)}/`;
+  return [
+    `✅ 已触发 ${job} 构建`,
+    `Jenkins 配置分支: ${previousBranch === targetBranch ? `${targetBranch}（未变更）` : `${previousBranch} → ${targetBranch}`}`,
+    build !== null
       ? `构建: #${build}  ${jobUrl}${build}/`
-      : `构建: 已入队（构建号未及取到）  ${jobUrl}`,
-  ].join("\n") + branchCheckWarn;
-  return logUpdateError
-    ? `${result}\n⚠️ 构建号 #${build} 未能补记到部署账本：${logUpdateError}；分支变更记录已保留，可正常回滚。`
-    : result;
-}
-
-// ─── list_history ────────────────────────────────────────────────────────────
-
-/** 部署记录，最新在前，最多 20 条 */
-export function runListHistory(job?: string): string {
-  const { records, corrupt } = readDeployLog(job);
-  const corruptNote = corrupt > 0 ? `\n⚠️ 发现 ${corrupt} 行损坏日志已跳过。` : "";
-  const recs = records.slice(0, 20);
-  if (recs.length === 0) {
-    return `暂无部署记录${job ? `（job=${job}）` : ""}。只有经本工具 deploy/rollback 的操作才会入账。` + corruptNote;
-  }
-  return recs
-    .map((r) => {
-      const t = new Date(r.time).toLocaleString("zh-CN");
-      const change = r.from === r.to ? `${r.to}（重新构建）` : `${r.from} → ${r.to}`;
-      const tag = r.op === "rollback" ? "  [回滚]" : "";
-      return `- [${t}] ${r.job}  ${change}${r.build ? `  #${r.build}` : ""}${tag}`;
-    })
-    .join("\n") + corruptNote;
-}
-
-// ─── rollback ────────────────────────────────────────────────────────────────
-
-/** 从账本找最近一次分支变更，切回变更前的分支；执行与防覆盖检查复用 runDeploy */
-export async function runRollback(job: string, force = false): Promise<string> {
-  const { records } = readDeployLog(job);
-  if (records.length === 0) {
-    return `无法回滚：${job} 没有部署记录。只有经本工具 deploy 的分支切换才可回滚。`;
-  }
-  // 跳过 rollback 自身产生的记录，否则连续回滚会在最近两个分支间横跳，够不到更早历史
-  const lastChange = records.find((r) => r.from !== r.to && r.op !== "rollback");
-  if (!lastChange) {
-    return `无法回滚：${job} 的记录里没有可回退的部署变更（只有重新构建或回滚记录）。`;
-  }
-  const result = await runDeploy(job, lastChange.from, force, "rollback");
-  return `回滚目标: ${lastChange.to} 切回 ${lastChange.from}（依据 ${new Date(lastChange.time).toLocaleString("zh-CN")} 的记录）\n${result}`;
+      : `构建: 已入队（15 秒内未取得构建号）  ${jobUrl}`,
+  ].join("\n") + protectionWarning;
 }
