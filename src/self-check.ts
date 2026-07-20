@@ -276,6 +276,51 @@ export async function runSelfCheck(): Promise<void> {
   eq(noStableBuildStatus.deployedBuild, null);
   eq(noStableBuildStatus.deployedBuildError, undefined);
 
+  // Job 配置不缓存：每次调用都重新读取，单批并发上限为 50。
+  const jobNames = Array.from({ length: 51 }, (_, index) => `TEST-qat-app-${index}`);
+  let jobListReads = 0;
+  let jobConfigReads = 0;
+  let activeConfigReads = 0;
+  let maxActiveConfigReads = 0;
+  let slowJobActive = false;
+  let refilledWhileSlowJobActive = false;
+  const uncachedJobsMock = createJenkinsClient({
+    baseUrl: "https://jenkins.example",
+    user: "test",
+    token: "token",
+    fetchImpl: async (input) => {
+      const url = new URL(input instanceof Request ? input.url : input.toString());
+      if (url.pathname === "/api/json") {
+        jobListReads += 1;
+        return jsonResponse({ jobs: jobNames.map((name) => ({ name })) });
+      }
+      if (url.pathname.endsWith("/config.xml")) {
+        jobConfigReads += 1;
+        activeConfigReads += 1;
+        maxActiveConfigReads = Math.max(maxActiveConfigReads, activeConfigReads);
+        if (url.pathname.endsWith("/job/TEST-qat-app-0/config.xml")) {
+          slowJobActive = true;
+          await new Promise((resolve) => setTimeout(resolve, 20));
+          slowJobActive = false;
+        } else {
+          if (url.pathname.endsWith("/job/TEST-qat-app-50/config.xml") && slowJobActive) {
+            refilledWhileSlowJobActive = true;
+          }
+          await new Promise((resolve) => setTimeout(resolve, 1));
+        }
+        activeConfigReads -= 1;
+        return new Response(configXml);
+      }
+      return jsonResponse({}, 404);
+    },
+  });
+  await uncachedJobsMock.listJenkinsJobs();
+  await uncachedJobsMock.listJenkinsJobs();
+  eq(jobListReads, 2);
+  eq(jobConfigReads, 102);
+  eq(maxActiveConfigReads, 50);
+  eq(refilledWhileSlowJobActive, true);
+
   // ── Injectable GitLab HTTP client: merge_base is a three-state ancestry check ──
   const gitlabMock = createGitlabClient({
     baseUrl: "https://gitlab.example///",

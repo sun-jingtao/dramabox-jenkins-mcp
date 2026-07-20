@@ -4,6 +4,7 @@ import { normalizeBaseUrl, requireEnv } from "./env.js";
 import { normalizeRepo, type JobInfo } from "./match.js";
 
 const FETCH_TIMEOUT_MS = 15_000;
+const JOB_CONFIG_CONCURRENCY = 50;
 
 export type FetchLike = (
   input: string | URL | Request,
@@ -216,7 +217,6 @@ const BUILD_TREE =
 
 export function createJenkinsClient(options: JenkinsClientOptions = {}) {
   const fetchImpl = options.fetchImpl ?? globalThis.fetch.bind(globalThis);
-  let jobCache: JobInfo[] | null = null;
 
   const connection = () => ({
     baseUrl: normalizeBaseUrl(options.baseUrl ?? requireEnv("JENKINS_URL")),
@@ -281,8 +281,6 @@ export function createJenkinsClient(options: JenkinsClientOptions = {}) {
       result.updated,
       "application/xml;charset=UTF-8"
     );
-    const cached = jobCache?.find((job) => job.name === name);
-    if (cached) cached.branch = newBranch;
     return result.oldBranch;
   };
 
@@ -376,28 +374,30 @@ export function createJenkinsClient(options: JenkinsClientOptions = {}) {
   };
 
   const listJenkinsJobs = async (): Promise<JobInfo[]> => {
-    if (jobCache) return jobCache;
     const { jobs } = JSON.parse(await jenkinsGet("/api/json?tree=jobs[name,_class]")) as {
       jobs: { name: string; _class?: string }[];
     };
-    const output: JobInfo[] = [];
-    for (let index = 0; index < jobs.length; index += 10) {
-      await Promise.all(
-        jobs.slice(index, index + 10).map(async ({ name, _class }) => {
-          if (_class && /folder/i.test(_class)) {
-            output.push({ name, remote: "", repo: null, branch: "", folder: true });
-            return;
-          }
-          try {
-            const xml = await jenkinsGet(`/job/${encodeURIComponent(name)}/config.xml`);
-            output.push({ name, ...parseJobConfig(xml) });
-          } catch {
-            output.push({ name, remote: "", repo: null, branch: "" });
-          }
-        })
-      );
-    }
-    jobCache = output;
+    const output = new Array<JobInfo>(jobs.length);
+    let nextIndex = 0;
+    const worker = async () => {
+      while (nextIndex < jobs.length) {
+        const index = nextIndex++;
+        const { name, _class } = jobs[index];
+        if (_class && /folder/i.test(_class)) {
+          output[index] = { name, remote: "", repo: null, branch: "", folder: true };
+          continue;
+        }
+        try {
+          const xml = await jenkinsGet(`/job/${encodeURIComponent(name)}/config.xml`);
+          output[index] = { name, ...parseJobConfig(xml) };
+        } catch {
+          output[index] = { name, remote: "", repo: null, branch: "" };
+        }
+      }
+    };
+    await Promise.all(
+      Array.from({ length: Math.min(JOB_CONFIG_CONCURRENCY, jobs.length) }, () => worker())
+    );
     return output;
   };
 
