@@ -1,6 +1,6 @@
 // Jenkins API: read real build state, update BranchSpec, and trigger builds.
 
-import { requireEnv } from "./env.js";
+import { normalizeBaseUrl, requireEnv } from "./env.js";
 import { normalizeRepo, type JobInfo } from "./match.js";
 
 const FETCH_TIMEOUT_MS = 15_000;
@@ -219,7 +219,7 @@ export function createJenkinsClient(options: JenkinsClientOptions = {}) {
   let jobCache: JobInfo[] | null = null;
 
   const connection = () => ({
-    baseUrl: (options.baseUrl ?? requireEnv("JENKINS_URL")).replace(/\/+$/, ""),
+    baseUrl: normalizeBaseUrl(options.baseUrl ?? requireEnv("JENKINS_URL")),
     user: options.user ?? requireEnv("JENKINS_USER"),
     token: options.token ?? requireEnv("JENKINS_TOKEN"),
   });

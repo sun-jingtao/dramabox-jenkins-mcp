@@ -15,5 +15,14 @@ export function requireEnv(key: string): string {
   if (!v) {
     throw new Error(`缺少环境变量 ${key}，请在 MCP 客户端配置的 env 中注入（勿写入对话）`);
   }
-  return v.replace(/\/+$/, "");
+  return v;
+}
+
+/** URL 专用归一化；凭证和用户名必须始终按原值使用。 */
+export function normalizeBaseUrl(value: string): string {
+  return value.replace(/\/+$/, "");
+}
+
+export function requireBaseUrl(key: string): string {
+  return normalizeBaseUrl(requireEnv(key));
 }

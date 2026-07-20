@@ -1,6 +1,6 @@
 // GitLab API: project lookup, target-branch validation, and commit ancestry.
 
-import { requireEnv } from "./env.js";
+import { normalizeBaseUrl, requireEnv } from "./env.js";
 import { normalizeRepo, type GitlabProject } from "./match.js";
 
 export type FetchLike = (
@@ -27,7 +27,7 @@ export interface MergeStatus {
 export function createGitlabClient(options: GitlabClientOptions = {}) {
   const fetchImpl = options.fetchImpl ?? globalThis.fetch.bind(globalThis);
   const connection = () => ({
-    baseUrl: (options.baseUrl ?? requireEnv("GITLAB_URL")).replace(/\/+$/, ""),
+    baseUrl: normalizeBaseUrl(options.baseUrl ?? requireEnv("GITLAB_URL")),
     token: options.token ?? requireEnv("GITLAB_TOKEN"),
   });
 

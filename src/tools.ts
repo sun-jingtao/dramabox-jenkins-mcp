@@ -3,7 +3,7 @@
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
 
-import { requireEnv } from "./env.js";
+import { requireBaseUrl } from "./env.js";
 import {
   branchExists,
   getCommitMergeStatus,
@@ -62,8 +62,8 @@ const defaultDependencies: ToolDependencies = {
   getProjectByPath,
   branchExists,
   getCommitMergeStatus,
-  gitlabUrl: () => requireEnv("GITLAB_URL"),
-  jenkinsUrl: () => requireEnv("JENKINS_URL"),
+  gitlabUrl: () => requireBaseUrl("GITLAB_URL"),
+  jenkinsUrl: () => requireBaseUrl("JENKINS_URL"),
 };
 
 function sameGitlabInstance(repo: string, deps: ToolDependencies): boolean {

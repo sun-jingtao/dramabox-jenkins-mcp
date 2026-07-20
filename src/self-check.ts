@@ -1,6 +1,7 @@
 // ─── 自检：守护 normalizeRepo 归一化与 matchJobs 匹配规则（每条断言对应一个真实踩过的坑）─
 // 纯函数、无需 env；跑法：npm run self-check
 
+import { normalizeBaseUrl, requireBaseUrl, requireEnv } from "./env.js";
 import { createGitlabClient, type MergeStatus, type ProjectRef } from "./gitlab.js";
 import {
   createJenkinsClient,
@@ -21,6 +22,23 @@ export async function runSelfCheck(): Promise<void> {
   const eq = (a: unknown, b: unknown) => {
     if (a !== b) throw new Error(`self-check 失败: ${a} !== ${b}`);
   };
+  // 配置读取保持凭证原值；只有 URL 使用专用尾斜杠归一化。
+  const tokenKey = "DRAMABOX_SELF_CHECK_TOKEN";
+  const urlKey = "DRAMABOX_SELF_CHECK_URL";
+  const previousToken = process.env[tokenKey];
+  const previousUrl = process.env[urlKey];
+  try {
+    process.env[tokenKey] = "token///";
+    process.env[urlKey] = "https://example.test///";
+    eq(requireEnv(tokenKey), "token///");
+    eq(requireBaseUrl(urlKey), "https://example.test");
+    eq(normalizeBaseUrl("https://example.test///"), "https://example.test");
+  } finally {
+    if (previousToken === undefined) delete process.env[tokenKey];
+    else process.env[tokenKey] = previousToken;
+    if (previousUrl === undefined) delete process.env[urlKey];
+    else process.env[urlKey] = previousUrl;
+  }
   // IP ↔ 域名归一到同一别名（HOST_ALIAS）
   eq(normalizeRepo("git@192.168.0.31:fe/dramabox_other.git"), "gitlab31:fe/dramabox_other");
   eq(normalizeRepo("https://gitlab31.dhwaj.cn/fe/dramabox_other.git"), "gitlab31:fe/dramabox_other");
@@ -190,11 +208,16 @@ export async function runSelfCheck(): Promise<void> {
       headers: { "content-type": "application/json" },
     });
   const jenkinsMock = createJenkinsClient({
-    baseUrl: "https://jenkins.example",
+    baseUrl: "https://jenkins.example///",
     user: "test",
-    token: "token",
-    fetchImpl: async (input) => {
+    token: "token/",
+    fetchImpl: async (input, init) => {
       const url = new URL(input instanceof Request ? input.url : input.toString());
+      if (url.pathname.startsWith("//")) {
+        throw new Error("self-check 失败: Jenkins base URL 尾斜杠未正确归一化");
+      }
+      const authorization = new Headers(init?.headers).get("Authorization") ?? "";
+      eq(Buffer.from(authorization.replace(/^Basic /, ""), "base64").toString(), "test:token/");
       if (url.pathname.endsWith("/config.xml")) return new Response(configXml);
       if (url.pathname.endsWith("/lastStableBuild/api/json")) {
         return jsonResponse(rawBuild(40, "SUCCESS", "feature-a", "abc123"));
@@ -255,10 +278,14 @@ export async function runSelfCheck(): Promise<void> {
 
   // ── Injectable GitLab HTTP client: merge_base is a three-state ancestry check ──
   const gitlabMock = createGitlabClient({
-    baseUrl: "https://gitlab.example",
-    token: "token",
-    fetchImpl: async (input) => {
+    baseUrl: "https://gitlab.example///",
+    token: "token/",
+    fetchImpl: async (input, init) => {
       const url = new URL(input instanceof Request ? input.url : input.toString());
+      if (url.pathname.startsWith("//")) {
+        throw new Error("self-check 失败: GitLab base URL 尾斜杠未正确归一化");
+      }
+      eq(new Headers(init?.headers).get("PRIVATE-TOKEN"), "token/");
       const [sha] = url.searchParams.getAll("refs[]");
       if (sha === "missing") return jsonResponse({}, 404);
       if (sha === "server-error") return jsonResponse({}, 500);
