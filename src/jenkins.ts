@@ -4,7 +4,6 @@ import { normalizeBaseUrl, requireEnv } from "./env.js";
 import { normalizeRepo, type JobInfo } from "./match.js";
 
 const FETCH_TIMEOUT_MS = 15_000;
-const JOB_CONFIG_CONCURRENCY = 50;
 
 export type FetchLike = (
   input: string | URL | Request,
@@ -374,31 +373,36 @@ export function createJenkinsClient(options: JenkinsClientOptions = {}) {
   };
 
   const listJenkinsJobs = async (): Promise<JobInfo[]> => {
-    const { jobs } = JSON.parse(await jenkinsGet("/api/json?tree=jobs[name,_class]")) as {
-      jobs: { name: string; _class?: string }[];
+    const { jobs } = JSON.parse(
+      await jenkinsGet(
+        "/api/json?tree=jobs[name,_class,scm[_class,userRemoteConfigs[url],branches[name]]]"
+      )
+    ) as {
+      jobs: {
+        name: string;
+        _class?: string;
+        scm?: {
+          _class?: string;
+          userRemoteConfigs?: { url?: string }[];
+          branches?: { name?: string }[];
+        } | null;
+      }[];
     };
-    const output = new Array<JobInfo>(jobs.length);
-    let nextIndex = 0;
-    const worker = async () => {
-      while (nextIndex < jobs.length) {
-        const index = nextIndex++;
-        const { name, _class } = jobs[index];
-        if (_class && /folder/i.test(_class)) {
-          output[index] = { name, remote: "", repo: null, branch: "", folder: true };
-          continue;
-        }
-        try {
-          const xml = await jenkinsGet(`/job/${encodeURIComponent(name)}/config.xml`);
-          output[index] = { name, ...parseJobConfig(xml) };
-        } catch {
-          output[index] = { name, remote: "", repo: null, branch: "" };
-        }
+    return jobs.map(({ name, _class, scm }) => {
+      if (_class && /folder/i.test(_class)) {
+        return { name, remote: "", repo: null, branch: "", folder: true };
       }
-    };
-    await Promise.all(
-      Array.from({ length: Math.min(JOB_CONFIG_CONCURRENCY, jobs.length) }, () => worker())
-    );
-    return output;
+      const remoteConfigs = scm?.userRemoteConfigs ?? [];
+      const branches = scm?.branches ?? [];
+      const remote = remoteConfigs[0]?.url ?? "";
+      return {
+        name,
+        remote,
+        repo: remote ? normalizeRepo(remote) : null,
+        branch: stripBranchPrefix(branches[0]?.name ?? ""),
+        multiScm: remoteConfigs.length > 1 || branches.length > 1 || undefined,
+      };
+    });
   };
 
   return {

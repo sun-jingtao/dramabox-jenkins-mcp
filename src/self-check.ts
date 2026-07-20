@@ -276,14 +276,8 @@ export async function runSelfCheck(): Promise<void> {
   eq(noStableBuildStatus.deployedBuild, null);
   eq(noStableBuildStatus.deployedBuildError, undefined);
 
-  // Job 配置不缓存：每次调用都重新读取，单批并发上限为 50。
-  const jobNames = Array.from({ length: 51 }, (_, index) => `TEST-qat-app-${index}`);
+  // Job 配置不缓存：每次调用通过一个 bulk API 请求读取完整 SCM 字段。
   let jobListReads = 0;
-  let jobConfigReads = 0;
-  let activeConfigReads = 0;
-  let maxActiveConfigReads = 0;
-  let slowJobActive = false;
-  let refilledWhileSlowJobActive = false;
   const uncachedJobsMock = createJenkinsClient({
     baseUrl: "https://jenkins.example",
     user: "test",
@@ -292,34 +286,52 @@ export async function runSelfCheck(): Promise<void> {
       const url = new URL(input instanceof Request ? input.url : input.toString());
       if (url.pathname === "/api/json") {
         jobListReads += 1;
-        return jsonResponse({ jobs: jobNames.map((name) => ({ name })) });
+        eq(
+          url.searchParams.get("tree"),
+          "jobs[name,_class,scm[_class,userRemoteConfigs[url],branches[name]]]"
+        );
+        return jsonResponse({
+          jobs: [
+            {
+              name: "TEST-qat-app",
+              _class: "hudson.model.FreeStyleProject",
+              scm: {
+                _class: "hudson.plugins.git.GitSCM",
+                userRemoteConfigs: [{ url: "git@192.168.0.31:fe/app.git" }],
+                branches: [{ name: `*/feature-${jobListReads}` }],
+              },
+            },
+            {
+              name: "TEST-hot-multi",
+              _class: "hudson.model.FreeStyleProject",
+              scm: {
+                _class: "hudson.plugins.git.GitSCM",
+                userRemoteConfigs: [
+                  { url: "git@192.168.0.31:fe/app.git" },
+                  { url: "git@192.168.0.31:fe/other.git" },
+                ],
+                branches: [{ name: "*/main" }, { name: "*/release" }],
+              },
+            },
+            {
+              name: "folder",
+              _class: "com.cloudbees.hudson.plugins.folder.Folder",
+            },
+          ],
+        });
       }
-      if (url.pathname.endsWith("/config.xml")) {
-        jobConfigReads += 1;
-        activeConfigReads += 1;
-        maxActiveConfigReads = Math.max(maxActiveConfigReads, activeConfigReads);
-        if (url.pathname.endsWith("/job/TEST-qat-app-0/config.xml")) {
-          slowJobActive = true;
-          await new Promise((resolve) => setTimeout(resolve, 20));
-          slowJobActive = false;
-        } else {
-          if (url.pathname.endsWith("/job/TEST-qat-app-50/config.xml") && slowJobActive) {
-            refilledWhileSlowJobActive = true;
-          }
-          await new Promise((resolve) => setTimeout(resolve, 1));
-        }
-        activeConfigReads -= 1;
-        return new Response(configXml);
-      }
-      return jsonResponse({}, 404);
+      throw new Error(`self-check 失败: bulk Job 查询不应请求 ${url.pathname}`);
     },
   });
-  await uncachedJobsMock.listJenkinsJobs();
-  await uncachedJobsMock.listJenkinsJobs();
+  const firstJobs = await uncachedJobsMock.listJenkinsJobs();
+  const secondJobs = await uncachedJobsMock.listJenkinsJobs();
   eq(jobListReads, 2);
-  eq(jobConfigReads, 102);
-  eq(maxActiveConfigReads, 50);
-  eq(refilledWhileSlowJobActive, true);
+  eq(firstJobs[0].remote, "git@192.168.0.31:fe/app.git");
+  eq(firstJobs[0].repo, "gitlab31:fe/app");
+  eq(firstJobs[0].branch, "feature-1");
+  eq(secondJobs[0].branch, "feature-2");
+  eq(firstJobs[1].multiScm, true);
+  eq(firstJobs[2].folder, true);
 
   // ── Injectable GitLab HTTP client: merge_base is a three-state ancestry check ──
   const gitlabMock = createGitlabClient({
