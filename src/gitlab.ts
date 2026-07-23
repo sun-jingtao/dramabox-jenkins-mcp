@@ -91,9 +91,16 @@ export function createGitlabClient(options: GitlabClientOptions = {}) {
     }
   };
 
-  const findMergedMr = async (project: ProjectRef, branch: string) =>
-    gitlabGet<{ iid: number }[]>(
-      `/projects/${project.id}/merge_requests?source_branch=${encodeURIComponent(branch)}&target_branch=${encodeURIComponent(project.defaultBranch)}&state=merged&per_page=1`
+  interface MergedMr {
+    iid: number;
+    sha?: string | null;
+    merge_commit_sha?: string | null;
+    squash_commit_sha?: string | null;
+  }
+
+  const findMergedMrs = async (project: ProjectRef, branch: string) =>
+    gitlabGet<MergedMr[]>(
+      `/projects/${project.id}/merge_requests?source_branch=${encodeURIComponent(branch)}&target_branch=${encodeURIComponent(project.defaultBranch)}&state=merged&per_page=20`
     );
 
   const getCommitMergeStatus = async (
@@ -126,12 +133,28 @@ export function createGitlabClient(options: GitlabClientOptions = {}) {
     let squashHint = "";
     if (deployedBranch && deployedBranch !== project.defaultBranch) {
       try {
-        const mergeRequests = await findMergedMr(project, deployedBranch);
-        if (mergeRequests && mergeRequests.length > 0) {
-          squashHint = `；发现来源分支 ${deployedBranch} 的已合并 MR !${mergeRequests[0].iid}，可能经过 squash，请人工确认后 force`;
+        const mergeRequests = (await findMergedMrs(project, deployedBranch)) ?? [];
+        // squash/rebase 合并会改写 SHA：当已合并 MR 合并时的来源 HEAD（mr.sha）与部署
+        // SHA 一致，且其落地提交已在主干时，即可证明部署内容已完整进入主干。
+        const matched = mergeRequests.find(
+          (mr) => mr.sha?.toLowerCase() === deployedSha.toLowerCase()
+        );
+        const landedSha = matched?.squash_commit_sha ?? matched?.merge_commit_sha;
+        if (
+          matched &&
+          landedSha &&
+          (await queryCommitMergedToDefaultBranch(project, landedSha)) === true
+        ) {
+          return {
+            state: "merged",
+            detail: `${deployedSha.slice(0, 8)} 经 MR !${matched.iid} 合并进入主干 ${project.defaultBranch}（落地提交 ${landedSha.slice(0, 8)}）`,
+          };
+        }
+        if (mergeRequests.length > 0) {
+          squashHint = `；发现来源分支 ${deployedBranch} 的已合并 MR !${mergeRequests[0].iid}，但其合并时 HEAD 与部署 SHA 不一致，无法证明部署内容已进入主干，请人工确认后 force`;
         }
       } catch {
-        // MR is diagnostic only and must not change the ancestry decision.
+        // MR 查询仅用于升级判定与诊断，失败不得改变 ancestry 结论（fail-closed）。
       }
     }
     return {

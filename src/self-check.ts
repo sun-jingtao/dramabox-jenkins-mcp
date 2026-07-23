@@ -343,10 +343,15 @@ export async function runSelfCheck(): Promise<void> {
         throw new Error("self-check 失败: GitLab base URL 尾斜杠未正确归一化");
       }
       eq(new Headers(init?.headers).get("PRIVATE-TOKEN"), "token/");
+      if (url.pathname.endsWith("/merge_requests")) {
+        return jsonResponse([
+          { iid: 217, sha: "squashed-head", merge_commit_sha: "merge-commit", squash_commit_sha: "landed" },
+        ]);
+      }
       const [sha] = url.searchParams.getAll("refs[]");
       if (sha === "missing") return jsonResponse({}, 404);
       if (sha === "server-error") return jsonResponse({}, 500);
-      return jsonResponse({ id: sha === "abc123" ? "abc123" : "common-base" });
+      return jsonResponse({ id: sha === "abc123" || sha === "landed" ? sha : "common-base" });
     },
   });
   const project: ProjectRef = { id: 1, defaultBranch: "master" };
@@ -357,6 +362,16 @@ export async function runSelfCheck(): Promise<void> {
   const mergeBaseError = await gitlabMock.getCommitMergeStatus(project, "server-error");
   if (mergeBaseError.state !== "unknown" || !mergeBaseError.detail.includes("返回 500")) {
     throw new Error("self-check 失败: merge_base unknown 应保留具体 HTTP 错误");
+  }
+  // squash 合并改写 SHA：部署 SHA == 已合并 MR 的来源 HEAD 且落地提交在主干 → 判定 merged
+  const squashMerged = await gitlabMock.getCommitMergeStatus(project, "squashed-head", "feature-x");
+  if (squashMerged.state !== "merged" || !squashMerged.detail.includes("!217")) {
+    throw new Error(`self-check 失败: squash 合并应自动判定 merged，实际 ${squashMerged.state}: ${squashMerged.detail}`);
+  }
+  // 部署 SHA 与 MR 合并时 HEAD 不一致（如合并后分支又有新提交）→ 仍拦截并给出提示
+  const squashMismatch = await gitlabMock.getCommitMergeStatus(project, "def456", "feature-x");
+  if (squashMismatch.state !== "not_merged" || !squashMismatch.detail.includes("!217")) {
+    throw new Error(`self-check 失败: MR HEAD 与部署 SHA 不一致必须保持拦截，实际 ${squashMismatch.state}: ${squashMismatch.detail}`);
   }
 
   // ── deploy orchestration: same branch, cross branch, and hard concurrency blocks ──
